@@ -31,7 +31,6 @@ impl Config {
             }
         }
 
-        // Try environment variables if no config file found
         Self::from_env()
     }
 
@@ -45,11 +44,7 @@ impl Config {
 
         for line in content.lines() {
             let line = line.trim();
-            if line.starts_with('#') || line.is_empty() {
-                continue;
-            }
-
-            if line.starts_with('[') {
+            if line.starts_with('#') || line.is_empty() || line.starts_with('[') {
                 continue;
             }
 
@@ -90,12 +85,9 @@ impl Config {
 
         let private_key_str = private_key_str
             .or_else(|| std::env::var("NOSTR_PRIVATE_KEY").ok())
-            .ok_or_else(|| {
-                anyhow::anyhow!("Missing private key (set in config or NOSTR_PRIVATE_KEY env var)")
-            })?;
+            .ok_or_else(|| anyhow::anyhow!("Missing private key"))?;
 
-        let secret_key =
-            parse_secret_key(&private_key_str).context("Failed to parse Nostr private key")?;
+        let secret_key = parse_secret_key(&private_key_str)?;
 
         Ok(Config {
             server_url,
@@ -114,8 +106,7 @@ impl Config {
         let private_key_str = std::env::var("NOSTR_PRIVATE_KEY")
             .or_else(|_| anyhow::bail!("Missing NOSTR_PRIVATE_KEY environment variable"))?;
 
-        let secret_key =
-            parse_secret_key(&private_key_str).context("Failed to parse Nostr private key")?;
+        let secret_key = parse_secret_key(&private_key_str)?;
 
         Ok(Config {
             server_url,
@@ -131,19 +122,11 @@ impl Config {
 fn parse_secret_key(key: &str) -> Result<[u8; 32]> {
     let key = key.trim();
 
-    // Handle nsec format (bech32)
     if key.starts_with("nsec1") {
-        // For now, just strip the prefix and decode as lowercase hex
-        // In production, should use proper bech32 decoding
-        let hex_part = key
-            .strip_prefix("nsec1")
-            .ok_or_else(|| anyhow::anyhow!("Invalid nsec format"))?;
-        hex::decode(hex_part)
-            .map_err(|e| anyhow::anyhow!("Failed to decode hex: {}", e))?
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("Invalid secret key length"))
+        let secret_key = nostr::SecretKey::parse(key)
+            .map_err(|e| anyhow::anyhow!("Failed to parse nsec: {}", e))?;
+        Ok(secret_key.secret_bytes())
     } else {
-        // Treat as hex
         hex::decode(key)
             .map_err(|e| anyhow::anyhow!("Failed to decode hex: {}", e))?
             .try_into()

@@ -1,9 +1,10 @@
 use crate::error::{BlossomLfsError, Result};
+use secp256k1::{Keypair, Message, Secp256k1, SecretKey, Signing, XOnlyPublicKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Minimal Nostr event for Blossom auth (kind 24242).
+/// NIP-01 Nostr event (minimal, just what Blossom needs).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NostrEvent {
     pub id: String,
@@ -16,7 +17,7 @@ pub struct NostrEvent {
     pub sig: String,
 }
 
-/// Compute SHA256 event ID as per NIP-01.
+/// Compute NIP-01 event ID: SHA256([0, pubkey, created_at, kind, tags, content]).
 pub fn compute_event_id(
     pubkey: &str,
     created_at: u64,
@@ -26,7 +27,7 @@ pub fn compute_event_id(
 ) -> [u8; 32] {
     let tags_json = serde_json::to_string(tags).unwrap_or_else(|_| "[]".to_string());
     let serialized = format!(
-        "[0,\"{}\",{},{},{} ,\"{}\"]",
+        "[0,\"{}\",{},{},{},\"{}\"]",
         pubkey,
         created_at,
         kind,
@@ -41,7 +42,7 @@ pub fn compute_event_id(
     out
 }
 
-/// Base64url encoding (no external crate dependency).
+/// Base64url encoding.
 fn base64url_encode(data: &[u8]) -> String {
     const BASE64_CHARS: &[u8; 64] =
         b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -76,14 +77,15 @@ impl AuthToken {
         blob_hashes: Option<Vec<&str>>,
         expiration_seconds: u64,
     ) -> Result<Self> {
-        use secp256k1::{Keypair, PublicKey, Secp256k1, SecretKey, Signing};
-
+        // Reconstruct keypair from secret key
         let secp = Secp256k1::signing_only();
         let secret_key_obj = SecretKey::from_slice(secret_key)
             .map_err(|e| BlossomLfsError::NostrSigning(e.to_string()))?;
         let keypair = Keypair::from_secret_key(&secp, &secret_key_obj);
-        let public_key = PublicKey::from_keypair(&keypair);
-        let pubkey_hex = hex::encode(public_key.serialize());
+        let (x_only_pubkey, _parity) = keypair.x_only_public_key();
+
+        // Get 32-byte x-only pubkey
+        let pubkey_hex = hex::encode(x_only_pubkey.serialize());
 
         let created_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -109,12 +111,14 @@ impl AuthToken {
 
         let content = action.description();
 
+        // Compute event ID
         let id_bytes = compute_event_id(&pubkey_hex, created_at, kind, &tags, content);
         let id = hex::encode(id_bytes);
 
-        let message = secp256k1::Message::from_digest_slice(&id_bytes)
+        // Sign with BIP-340 Schnorr
+        let message = Message::from_digest_slice(&id_bytes)
             .map_err(|e| BlossomLfsError::NostrSigning(e.to_string()))?;
-        let sig = secp.sign_schnorr(&message, &keypair);
+        let sig = secp.sign_schnorr_no_aux_rand(&message, &keypair);
         let sig_hex = hex::encode(sig.serialize());
 
         let event = NostrEvent {
@@ -175,10 +179,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_base64url_encode() {
-        let input = b"hello world";
-        let encoded = base64url_encode(input);
-        assert!(encoded.contains('-') || !encoded.contains('+'));
-        assert!(!encoded.contains('/'));
+    fn test_auth_token_creation() {
+        let secret_key = [1u8; 32];
+        let auth = AuthToken::new(
+            &secret_key,
+            ActionType::Upload,
+            Some("localhost:12345"),
+            None,
+            3600,
+        );
+        assert!(auth.is_ok());
     }
 }
