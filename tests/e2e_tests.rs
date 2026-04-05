@@ -142,10 +142,9 @@ mod tests {
         chunking::{Chunker, Manifest},
         blossom::{AuthToken, ActionType},
     };
-    use secp256k1::{SecretKey, Secp256k1};
+    use secp256k1::SecretKey;
 
     fn generate_test_key() -> [u8; 32] {
-        let secp = Secp256k1::new();
         let mut rng = secp256k1::rand::thread_rng();
         let secret_key = SecretKey::new(&mut rng);
         let mut key_bytes = [0u8; 32];

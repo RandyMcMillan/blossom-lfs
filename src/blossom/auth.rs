@@ -1,5 +1,5 @@
 use crate::error::{BlossomLfsError, Result};
-use secp256k1::{Keypair, Message, Secp256k1, SecretKey, Signing, XOnlyPublicKey};
+use secp256k1::{Keypair, Message, Secp256k1, SecretKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};

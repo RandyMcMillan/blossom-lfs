@@ -9,8 +9,6 @@ use anyhow::Context as _;
 use log::debug;
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio_util::compat::{TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt as _};
 
 const TEMP_DIR: &str = ".blossom-lfs-tmp";
 
@@ -63,8 +61,7 @@ impl Agent {
         let client = self.client.clone();
         let sender = self.sender.clone();
         let chunker = self.chunker.clone();
-        let temp_dir = self.temp_dir.clone();
-        
+
         self.tasks.spawn(async move {
             let status: Result<Option<String>> = async {
                 let file_path = PathBuf::from(&path);
@@ -81,52 +78,43 @@ impl Agent {
                         file_size,
                         &sender,
                         &oid,
-                        &temp_dir,
                     ).await?)
                 } else {
                     None
                 };
                 
-                let manifest = if let Some(hashes) = chunk_hashes {
-                    Manifest::new(
+                if let Some(hashes) = chunk_hashes {
+                    // Chunked upload: create and upload manifest
+                    let manifest = Manifest::new(
                         file_size,
                         config.chunk_size,
                         hashes,
                         file_path.file_name().and_then(|n| n.to_str()).map(String::from),
                         None,
                         Some(config.server_url.clone()),
-                    ).context("Failed to create manifest")?
+                    ).context("Failed to create manifest")?;
+
+                    let manifest_json = manifest.to_json()
+                        .context("Failed to serialize manifest")?;
+                    let manifest_data = manifest_json.into_bytes();
+                    let manifest_hash = hash_data(&manifest_data);
+
+                    let auth_token = create_auth_token(&config, ActionType::Upload, Some(&manifest_hash))?;
+                    client.upload_blob(manifest_data, &manifest_hash, Some("application/json"), Some(&auth_token))
+                        .await?;
                 } else {
+                    // Single blob upload: upload raw data directly under its hash (= OID)
                     let data = tokio::fs::read(&file_path).await
                         .context("Failed to read file")?;
                     let hash = hash_data(&data);
-                    
-let auth_token = create_auth_token(&config, ActionType::Upload, Some(&hash))?;
-                    
+
+                    let auth_token = create_auth_token(&config, ActionType::Upload, Some(&hash))?;
                     client.upload_blob(data.clone(), &hash, None, Some(&auth_token))
                         .await?;
-                    
+
                     send_progress(&sender, &oid, data.len(), data.len(), data.len()).await;
-                    
-                    Manifest::new(
-                        file_size,
-                        config.chunk_size,
-                        vec![hash],
-                        file_path.file_name().and_then(|n| n.to_str()).map(String::from),
-                        None,
-                        Some(config.server_url.clone()),
-                    ).context("Failed to create manifest")?
-                };
-                
-                let manifest_json = manifest.to_json()
-                    .context("Failed to serialize manifest")?;
-                let manifest_data = manifest_json.into_bytes();
-                let manifest_hash = hash_data(&manifest_data);
-                
-                let auth_token = create_auth_token(&config, ActionType::Upload, Some(&manifest_hash))?;
-                client.upload_blob(manifest_data, &manifest_hash, Some("application/json"), Some(&auth_token))
-                    .await?;
-                
+                }
+
                 Ok(None)
             }
             .await;
@@ -139,55 +127,67 @@ let auth_token = create_auth_token(&config, ActionType::Upload, Some(&hash))?;
         let config = self.config.clone();
         let client = self.client.clone();
         let sender = self.sender.clone();
-        let chunker = self.chunker.clone();
         let temp_dir = self.temp_dir.clone();
         let output_path = lfs_object_path(&oid);
         
         self.tasks.spawn(async move {
             let status: Result<Option<String>> = async {
                 let auth_token = create_auth_token(&config, ActionType::Get, Some(&oid))?;
-                
+
                 send_progress(&sender, &oid, 0, 0, 0).await;
-                
-                let manifest_data = client.download_blob(&oid, Some(&auth_token))
+
+                let blob_data = client.download_blob(&oid, Some(&auth_token))
                     .await
                     .map_err(|e| BlossomLfsError::from(e))?;
-                
-                let manifest = Manifest::from_json(&String::from_utf8_lossy(&manifest_data))
-                    .map_err(|e| BlossomLfsError::from(e))?;
-                
-                if !manifest.verify().map_err(|e| BlossomLfsError::from(e))? {
-                    return Err(BlossomLfsError::MerkleVerificationFailed.into());
-                }
-                
-                let total_size = manifest.file_size as usize;
-                send_progress(&sender, &oid, 0, total_size, 0).await;
-                
+
                 tokio::fs::create_dir_all(output_path.parent().unwrap()).await
                     .context("Failed to create output directory")?;
-                
-                if manifest.chunks == 1 && manifest.file_size <= config.chunk_size as u64 {
-                    let chunk_data = client.download_blob(&manifest.chunk_hashes[0], Some(&auth_token))
-                        .await
-                        .context("Failed to download single chunk")?;
-                    
-                    tokio::fs::write(&output_path, &chunk_data).await
-                        .context("Failed to write file")?;
-                    
-                    send_progress(&sender, &oid, total_size, total_size, total_size).await;
+
+                // Try to parse as manifest; if it fails, treat as raw blob
+                let manifest_result = std::str::from_utf8(&blob_data)
+                    .ok()
+                    .and_then(|s| Manifest::from_json(s).ok());
+
+                if let Some(manifest) = manifest_result {
+                    if !manifest.verify().map_err(|e| BlossomLfsError::from(e))? {
+                        return Err(BlossomLfsError::MerkleVerificationFailed.into());
+                    }
+
+                    let total_size = manifest.file_size as usize;
+                    send_progress(&sender, &oid, 0, total_size, 0).await;
+
+                    if manifest.chunks == 1 {
+                        let chunk_data = client.download_blob(&manifest.chunk_hashes[0], Some(&auth_token))
+                            .await
+                            .context("Failed to download single chunk")?;
+
+                        tokio::fs::write(&output_path, &chunk_data).await
+                            .context("Failed to write file")?;
+
+                        send_progress(&sender, &oid, total_size, total_size, total_size).await;
+                    } else {
+                        download_chunked_file(
+                            &client,
+                            &config,
+                            &manifest,
+                            &output_path,
+                            &sender,
+                            &oid,
+                            &temp_dir,
+                        ).await
+                        .context("Failed to download chunked file")?;
+                    }
                 } else {
-                    download_chunked_file(
-                        &client,
-                        &config,
-                        &manifest,
-                        &output_path,
-                        &sender,
-                        &oid,
-                        &temp_dir,
-                    ).await
-                    .context("Failed to download chunked file")?;
+                    // Raw blob — write directly
+                    let total_size = blob_data.len();
+                    send_progress(&sender, &oid, 0, total_size, 0).await;
+
+                    tokio::fs::write(&output_path, &blob_data).await
+                        .context("Failed to write file")?;
+
+                    send_progress(&sender, &oid, total_size, total_size, total_size).await;
                 }
-                
+
                 Ok(Some(output_path.to_string_lossy().into()))
             }
             .await;
@@ -209,7 +209,6 @@ async fn upload_chunked_file(
     file_size: u64,
     sender: &tokio::sync::mpsc::Sender<String>,
     oid: &str,
-    temp_dir: &PathBuf,
 ) -> Result<Vec<String>> {
     let (chunks, _) = chunker.chunk_file(file_path).await
         .map_err(|e| BlossomLfsError::from(e))?;
@@ -305,7 +304,7 @@ async fn send_progress(
 ) {
     send_response(
         sender,
-        ProgressResponse::new(oid.to_string(), bytes_so_far, bytes_since_last).json(),
+        ProgressResponse::new(oid.to_string(), bytes_so_far, total_bytes, bytes_since_last).json(),
     )
     .await;
 }
@@ -320,8 +319,6 @@ fn lfs_object_path(oid: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
-    
     #[test]
     fn test_hash_data() {
         let hash = hash_data(b"test");

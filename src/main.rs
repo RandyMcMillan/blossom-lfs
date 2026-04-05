@@ -1,4 +1,3 @@
-mod config;
 use blossom_lfs::{Agent, Config};
 use clap::Parser;
 use log::error;

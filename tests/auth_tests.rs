@@ -1,8 +1,7 @@
 use blossom_lfs::blossom::{ActionType, AuthToken};
-use secp256k1::{Secp256k1, SecretKey};
+use secp256k1::SecretKey;
 
 fn generate_test_key() -> [u8; 32] {
-    let secp = Secp256k1::new();
     let mut rng = secp256k1::rand::thread_rng();
     let secret_key = SecretKey::new(&mut rng);
     let mut key_bytes = [0u8; 32];
@@ -35,7 +34,7 @@ fn test_auth_token_different_actions() {
 
     let upload_token = AuthToken::new(&secret_key, ActionType::Upload, None, None, 3600).unwrap();
     let get_token = AuthToken::new(&secret_key, ActionType::Get, None, None, 3600).unwrap();
-    let delete_token = AuthToken::new(&secret_key, ActionType::Delete, None, None, 3600).unwrap();
+    let _delete_token = AuthToken::new(&secret_key, ActionType::Delete, None, None, 3600).unwrap();
 
     // Different actions should produce different events
     // But the same secret key should have same pubkey

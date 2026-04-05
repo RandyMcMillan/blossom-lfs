@@ -51,16 +51,19 @@ pub struct ProgressResponse {
     oid: String,
     #[serde(rename = "bytesSoFar")]
     bytes_so_far: usize,
+    #[serde(rename = "totalBytes")]
+    total_bytes: usize,
     #[serde(rename = "bytesSinceLast")]
     bytes_since_last: usize,
 }
 
 impl ProgressResponse {
-    pub fn new(oid: String, bytes_so_far: usize, bytes_since_last: usize) -> Self {
+    pub fn new(oid: String, bytes_so_far: usize, total_bytes: usize, bytes_since_last: usize) -> Self {
         Self {
             event: String::from("progress"),
             oid,
             bytes_so_far,
+            total_bytes,
             bytes_since_last,
         }
     }

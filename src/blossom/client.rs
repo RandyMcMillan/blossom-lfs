@@ -1,17 +1,14 @@
 use crate::{
     blossom::{
-        auth::{AuthToken, ActionType},
-        types::{BlobDescriptor},
+        auth::AuthToken,
+        types::BlobDescriptor,
     },
     error::{BlossomLfsError, Result},
 };
-use bytes::Bytes;
-use futures_util::Stream;
 use reqwest::{
     header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE, CONTENT_LENGTH},
-    Body, Client,Response, StatusCode,
+    Client, StatusCode,
 };
-use std::pin::Pin;
 
 #[derive(Clone)]
 pub struct BlossomClient {

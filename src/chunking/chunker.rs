@@ -5,7 +5,6 @@ use tokio::{
     fs::File,
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
 };
-use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
 pub struct Chunk {
