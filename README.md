@@ -13,17 +13,46 @@ Git LFS custom transfer agent for Blossom blob storage with chunking support for
 
 ## Installation
 
+### Quick Start (Recommended)
+
 ```bash
-cargo install blossom-lfs
+# Clone the repository
+git clone https://github.com/MonumentalSystems/blossom-lfs.git
+cd blossom-lfs
+
+# Build release binary
+cargo build --release
+
+# Run automated setup script
+./setup.sh
+
+# Test your configuration
+./test-setup.sh
 ```
 
-Or build from source:
+### Manual Installation
 
 ```bash
-git clone https://github.com/MonumentalSystems/BlossomLFS
-cd BlossomLFS
+# Install from crates.io (when published)
+cargo install blossom-lfs
+
+# Or build from source
+git clone https://github.com/MonumentalSystems/blossom-lfs.git
+cd blossom-lfs
 cargo build --release
 ```
+
+### Verify Installation
+
+```bash
+# Test binary is working
+./target/release/blossom-lfs --help
+
+# Show configuration options
+./target/release/blossom-lfs --config-info
+```
+
+For detailed setup and troubleshooting, see [QUICKSTART.md](QUICKSTART.md).
 
 ## Configuration
 
