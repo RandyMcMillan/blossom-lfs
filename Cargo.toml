@@ -14,8 +14,8 @@ default = []
 iroh = ["blossom-rs/iroh-transport", "blossom-rs/pkarr-discovery", "dep:iroh"]
 
 [dependencies]
-# Blossom protocol client & auth (path dep until unified-client branch ships)
-blossom-rs = { path = "/rjs/MonumentalSystems/blossom-rs", default-features = false, features = ["client"] }
+# Blossom protocol client & auth
+blossom-rs = { version = "0.3", default-features = false, features = ["client"] }
 
 # Async runtime
 tokio = { version = "1.39", features = ["fs", "io-std", "macros", "rt-multi-thread", "sync"]}
