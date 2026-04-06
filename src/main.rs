@@ -48,7 +48,6 @@ async fn run() -> anyhow::Result<()> {
         println!("    lfs-dal.chunk-size = 16777216 (default: 16MB)");
         println!("    lfs-dal.max-concurrent-uploads = 8 (default)");
         println!("    lfs-dal.max-concurrent-downloads = 8 (default)");
-        println!("    lfs-dal.auth-expiration = 3600 (default: 1 hour)");
         println!();
         println!("  Or use environment variables:");
         println!("    BLOSSOM_SERVER_URL = <blossom_server_url>");

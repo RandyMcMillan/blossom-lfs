@@ -138,66 +138,41 @@ pub async fn create_test_server() -> (String, SharedBlobStore) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use blossom_lfs::{
-        blossom::BlossomClient,
-        blossom::{ActionType, AuthToken},
-        chunking::{Chunker, Manifest},
-    };
-    use secp256k1::SecretKey;
+    use blossom_lfs::chunking::{Chunker, Manifest};
+    use blossom_rs::{auth::Signer, BlossomClient};
 
-    fn generate_test_key() -> [u8; 32] {
-        let mut rng = secp256k1::rand::thread_rng();
-        let secret_key = SecretKey::new(&mut rng);
-        let mut key_bytes = [0u8; 32];
-        key_bytes.copy_from_slice(&secret_key.secret_bytes());
-        key_bytes
+    fn create_test_client(server_url: String) -> BlossomClient {
+        let signer = Signer::generate();
+        BlossomClient::new(vec![server_url], signer)
     }
 
     #[tokio::test]
     async fn test_full_upload_download_cycle() {
         let (server_url, _store) = create_test_server().await;
-        let client = BlossomClient::new(server_url).unwrap();
-        let secret_key = generate_test_key();
+        let client = create_test_client(server_url);
 
         // Upload a blob
-        let data = b"hello world from blossom".to_vec();
-        let hash = format!("{:x}", Sha256::digest(&data));
+        let data = b"hello world from blossom";
 
-        let auth_token = AuthToken::new(
-            &secret_key,
-            ActionType::Upload,
-            None,
-            Some(vec![&hash]),
-            3600,
-        )
-        .unwrap();
+        let result = client.upload(data, "application/octet-stream").await;
+        assert!(result.is_ok(), "Upload should succeed: {:?}", result.err());
 
-        let result = client
-            .upload_blob(data.clone(), &hash, None, Some(&auth_token))
-            .await;
-
-        assert!(result.is_ok(), "Upload should succeed");
         let descriptor = result.unwrap();
-        assert_eq!(descriptor.sha256, hash);
+        let hash = descriptor.sha256.clone();
 
         // Download the blob
-        let auth_token = AuthToken::new(&secret_key, ActionType::Get, None, None, 3600).unwrap();
-
-        let downloaded = client.download_blob(&hash, Some(&auth_token)).await;
-        assert!(downloaded.is_ok(), "Download should succeed");
-        assert_eq!(downloaded.unwrap(), data);
+        let downloaded: Vec<u8> = client.download(&hash).await.unwrap();
+        assert_eq!(downloaded, data.to_vec());
 
         // Check blob exists
-        let exists = client.has_blob(&hash, Some(&auth_token)).await;
-        assert!(exists.is_ok(), "Has blob should succeed");
-        assert!(exists.unwrap(), "Blob should exist");
+        let exists = client.exists(&hash).await.unwrap();
+        assert!(exists, "Blob should exist");
     }
 
     #[tokio::test]
     async fn test_chunked_file_workflow() {
         let (server_url, _store) = create_test_server().await;
-        let client = BlossomClient::new(server_url).unwrap();
-        let secret_key = generate_test_key();
+        let client = create_test_client(server_url);
 
         use std::io::Write;
         use tempfile::NamedTempFile;
@@ -221,20 +196,8 @@ mod tests {
                 .await
                 .unwrap();
 
-            let auth_token = AuthToken::new(
-                &secret_key,
-                ActionType::Upload,
-                None,
-                Some(vec![&chunk.hash]),
-                3600,
-            )
-            .unwrap();
-
-            let result = client
-                .upload_blob(chunk_data, &chunk.hash, None, Some(&auth_token))
-                .await;
-
-            assert!(result.is_ok(), "Chunk upload should succeed");
+            let result = client.upload(&chunk_data, "application/octet-stream").await;
+            assert!(result.is_ok(), "Chunk upload should succeed: {:?}", result.err());
         }
 
         // Create and upload manifest
@@ -250,42 +213,18 @@ mod tests {
         .unwrap();
 
         let manifest_json = manifest.to_json().unwrap();
-        let manifest_data = manifest_json.into_bytes();
-        let manifest_hash = format!("{:x}", sha2::Sha256::digest(&manifest_data));
+        let manifest_data = manifest_json.as_bytes();
 
-        let auth_token = AuthToken::new(
-            &secret_key,
-            ActionType::Upload,
-            None,
-            Some(vec![&manifest_hash]),
-            3600,
-        )
-        .unwrap();
+        let result = client.upload(manifest_data, "application/json").await;
+        assert!(result.is_ok(), "Manifest upload should succeed: {:?}", result.err());
 
-        let result = client
-            .upload_blob(
-                manifest_data,
-                &manifest_hash,
-                Some("application/json"),
-                Some(&auth_token),
-            )
-            .await;
-
-        assert!(result.is_ok(), "Manifest upload should succeed");
+        let manifest_hash = result.unwrap().sha256;
 
         // Download and verify manifest
-        let auth_token = AuthToken::new(&secret_key, ActionType::Get, None, None, 3600).unwrap();
-
-        let downloaded_manifest = client
-            .download_blob(&manifest_hash, Some(&auth_token))
-            .await;
-        assert!(
-            downloaded_manifest.is_ok(),
-            "Manifest download should succeed"
-        );
+        let downloaded_manifest: Vec<u8> = client.download(&manifest_hash).await.unwrap();
 
         let parsed_manifest =
-            Manifest::from_json(&String::from_utf8_lossy(&downloaded_manifest.unwrap())).unwrap();
+            Manifest::from_json(&String::from_utf8_lossy(&downloaded_manifest)).unwrap();
 
         assert_eq!(parsed_manifest.file_size, 2048);
         assert_eq!(parsed_manifest.chunks, 4);
@@ -293,41 +232,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_auth_token_workflow() {
-        let secret_key = generate_test_key();
+    async fn test_auth_is_handled_by_client() {
+        let (server_url, _store) = create_test_server().await;
+        let client = create_test_client(server_url);
 
-        // Create token for upload
-        let upload_token = AuthToken::new(
-            &secret_key,
-            ActionType::Upload,
-            Some("localhost"),
-            Some(vec!["abc123"]),
-            3600,
-        )
-        .unwrap();
-
-        let header = upload_token.to_authorization_header().unwrap();
-        assert!(header.starts_with("Nostr "), "Should have Nostr prefix");
-
-        // Create token for download
-        let get_token =
-            AuthToken::new(&secret_key, ActionType::Get, Some("localhost"), None, 3600).unwrap();
-
-        // Tokens should have different 't' tags
-        let upload_t_tags: Vec<_> = upload_token
-            .event
-            .tags
-            .iter()
-            .filter(|t| t[0] == "t")
-            .collect();
-        let get_t_tags: Vec<_> = get_token
-            .event
-            .tags
-            .iter()
-            .filter(|t| t[0] == "t")
-            .collect();
-
-        assert!(upload_t_tags.iter().any(|t| t[1] == "upload"));
-        assert!(get_t_tags.iter().any(|t| t[1] == "get"));
+        // Auth is handled internally by the client — just verify operations succeed
+        let data = b"auth test data";
+        let result = client.upload(data, "application/octet-stream").await;
+        assert!(result.is_ok(), "Upload with internal auth should succeed");
     }
 }

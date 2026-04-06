@@ -1,20 +1,21 @@
 use crate::{
-    blossom::{ActionType, AuthToken, BlossomClient},
     chunking::{ChunkAssembler, Chunker, Manifest},
     config::Config,
     error::{BlossomLfsError, Result},
     protocol::{InitResponse, ProgressResponse, TransferResponse},
 };
 use anyhow::Context as _;
+use blossom_rs::{auth::Signer, BlossomClient};
 use log::debug;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 const TEMP_DIR: &str = ".blossom-lfs-tmp";
 
 pub struct Agent {
     config: Config,
-    client: BlossomClient,
+    client: Arc<BlossomClient>,
     sender: tokio::sync::mpsc::Sender<String>,
     tasks: tokio::task::JoinSet<()>,
     chunker: Chunker,
@@ -23,7 +24,13 @@ pub struct Agent {
 
 impl Agent {
     pub fn new(config: Config, sender: tokio::sync::mpsc::Sender<String>) -> Result<Self> {
-        let client = BlossomClient::new(config.server_url.clone())?;
+        let signer = Signer::from_secret_hex(&config.secret_key_hex)
+            .map_err(|e| BlossomLfsError::Config(format!("Failed to create signer: {}", e)))?;
+        let client = Arc::new(BlossomClient::with_timeout(
+            vec![config.server_url.clone()],
+            signer,
+            std::time::Duration::from_secs(300),
+        ));
         let chunker = Chunker::new(config.chunk_size)?;
         let temp_dir = PathBuf::from(TEMP_DIR);
 
@@ -58,7 +65,7 @@ impl Agent {
 
     async fn upload(&mut self, oid: String, path: String) {
         let config = self.config.clone();
-        let client = self.client.clone();
+        let client = Arc::clone(&self.client);
         let sender = self.sender.clone();
         let chunker = self.chunker.clone();
 
@@ -70,59 +77,31 @@ impl Agent {
                     .context("Failed to read file metadata")?;
                 let file_size = metadata.len();
 
-                let chunk_hashes = if chunker.should_chunk(file_size) {
-                    Some(
-                        upload_chunked_file(
-                            &client, &config, &chunker, &file_path, file_size, &sender, &oid,
-                        )
-                        .await?,
+                if chunker.should_chunk(file_size) {
+                    upload_chunked_file(
+                        &client, &config, &chunker, &file_path, file_size, &sender, &oid,
                     )
-                } else {
-                    None
-                };
-
-                if chunk_hashes.is_some() {
-                    // Chunked upload complete — chunks are on the server.
-                    // Now upload the complete file so it's retrievable by OID.
-                    let data = tokio::fs::read(&file_path)
-                        .await
-                        .context("Failed to read file")?;
-                    let hash = hash_data(&data);
-
-                    let auth_token = create_auth_token(&config, ActionType::Upload, Some(&hash))?;
-                    client
-                        .upload_blob(data, &hash, None, Some(&auth_token))
-                        .await?;
-
-                    send_progress(
-                        &sender,
-                        &oid,
-                        file_size as usize,
-                        file_size as usize,
-                        file_size as usize,
-                    )
-                    .await;
-                } else {
-                    // Single blob upload: upload raw data directly under its hash (= OID)
-                    let data = tokio::fs::read(&file_path)
-                        .await
-                        .context("Failed to read file")?;
-                    let hash = hash_data(&data);
-
-                    let auth_token = create_auth_token(&config, ActionType::Upload, Some(&hash))?;
-                    client
-                        .upload_blob(data, &hash, None, Some(&auth_token))
-                        .await?;
-
-                    send_progress(
-                        &sender,
-                        &oid,
-                        file_size as usize,
-                        file_size as usize,
-                        file_size as usize,
-                    )
-                    .await;
+                    .await?;
                 }
+
+                // Upload the complete file so it's retrievable by OID
+                let data = tokio::fs::read(&file_path)
+                    .await
+                    .context("Failed to read file")?;
+
+                client
+                    .upload(&data, "application/octet-stream")
+                    .await
+                    .map_err(BlossomLfsError::Blossom)?;
+
+                send_progress(
+                    &sender,
+                    &oid,
+                    file_size as usize,
+                    file_size as usize,
+                    file_size as usize,
+                )
+                .await;
 
                 Ok(None)
             }
@@ -133,19 +112,20 @@ impl Agent {
     }
 
     async fn download(&mut self, oid: String) {
-        let config = self.config.clone();
-        let client = self.client.clone();
+        let client = Arc::clone(&self.client);
         let sender = self.sender.clone();
         let temp_dir = self.temp_dir.clone();
+        let config = self.config.clone();
         let output_path = lfs_object_path(&oid);
 
         self.tasks.spawn(async move {
             let status: Result<Option<String>> = async {
-                let auth_token = create_auth_token(&config, ActionType::Get, Some(&oid))?;
-
                 send_progress(&sender, &oid, 0, 0, 0).await;
 
-                let blob_data = client.download_blob(&oid, Some(&auth_token)).await?;
+                let blob_data: Vec<u8> = client
+                    .download(&oid)
+                    .await
+                    .map_err(BlossomLfsError::Blossom)?;
 
                 tokio::fs::create_dir_all(output_path.parent().unwrap())
                     .await
@@ -165,10 +145,10 @@ impl Agent {
                     send_progress(&sender, &oid, 0, total_size, 0).await;
 
                     if manifest.chunks == 1 {
-                        let chunk_data = client
-                            .download_blob(&manifest.chunk_hashes[0], Some(&auth_token))
+                        let chunk_data: Vec<u8> = client
+                            .download(&manifest.chunk_hashes[0])
                             .await
-                            .context("Failed to download single chunk")?;
+                            .map_err(BlossomLfsError::Blossom)?;
 
                         tokio::fs::write(&output_path, &chunk_data)
                             .await
@@ -215,7 +195,7 @@ impl Agent {
 
 async fn upload_chunked_file(
     client: &BlossomClient,
-    config: &Config,
+    _config: &Config,
     chunker: &Chunker,
     file_path: &Path,
     file_size: u64,
@@ -223,8 +203,6 @@ async fn upload_chunked_file(
     oid: &str,
 ) -> Result<Vec<String>> {
     let (chunks, _) = chunker.chunk_file(file_path).await?;
-
-    let auth_token = create_auth_token(config, ActionType::Upload, None)?;
 
     let mut bytes_so_far = 0usize;
     let mut chunk_hashes = Vec::new();
@@ -237,8 +215,9 @@ async fn upload_chunked_file(
         let chunk_hash = hash_data(&chunk_data);
 
         client
-            .upload_blob(chunk_data.clone(), &chunk_hash, None, Some(&auth_token))
-            .await?;
+            .upload(&chunk_data, "application/octet-stream")
+            .await
+            .map_err(BlossomLfsError::Blossom)?;
 
         chunk_hashes.push(chunk_hash);
         bytes_so_far += chunk.size;
@@ -251,23 +230,23 @@ async fn upload_chunked_file(
 
 async fn download_chunked_file(
     client: &BlossomClient,
-    config: &Config,
+    _config: &Config,
     manifest: &Manifest,
     output_path: &Path,
     sender: &tokio::sync::mpsc::Sender<String>,
     oid: &str,
     temp_dir: &Path,
 ) -> Result<()> {
-    let auth_token = create_auth_token(config, ActionType::Get, None)?;
     let assembler = ChunkAssembler::new(temp_dir.to_path_buf());
 
     let mut bytes_so_far = 0usize;
     let total_size = manifest.file_size as usize;
 
     for chunk_info in manifest.all_chunk_info()? {
-        let chunk_data = client
-            .download_blob(&chunk_info.hash, Some(&auth_token))
-            .await?;
+        let chunk_data: Vec<u8> = client
+            .download(&chunk_info.hash)
+            .await
+            .map_err(BlossomLfsError::Blossom)?;
 
         assembler
             .write_chunk(oid, chunk_info.index, &chunk_data)
@@ -284,26 +263,6 @@ async fn download_chunked_file(
     assembler.cleanup(oid).await?;
 
     Ok(())
-}
-
-fn create_auth_token(
-    config: &Config,
-    action: ActionType,
-    blob_hash: Option<&str>,
-) -> Result<AuthToken> {
-    let hashes: Vec<&str> = blob_hash.map(|h| vec![h]).unwrap_or_default();
-
-    AuthToken::new(
-        &config.secret_key,
-        action,
-        Some(&config.server_url),
-        if hashes.is_empty() {
-            None
-        } else {
-            Some(hashes)
-        },
-        config.auth_expiration,
-    )
 }
 
 fn hash_data(data: &[u8]) -> String {

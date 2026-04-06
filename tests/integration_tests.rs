@@ -1,112 +1,82 @@
-use blossom_lfs::{blossom::BlossomClient, chunking::Manifest, config::Config};
-use secp256k1::SecretKey;
+use blossom_lfs::chunking::Manifest;
+use blossom_rs::{auth::Signer, BlossomClient};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-fn generate_test_config() -> Config {
-    let mut rng = secp256k1::rand::thread_rng();
-    let secret_key = SecretKey::new(&mut rng);
-    let mut key_bytes = [0u8; 32];
-    key_bytes.copy_from_slice(&secret_key.secret_bytes());
-
-    Config {
-        server_url: "http://localhost:8080".to_string(),
-        secret_key: key_bytes,
-        chunk_size: 1024 * 1024, // 1MB for tests
-        max_concurrent_uploads: 4,
-        max_concurrent_downloads: 4,
-        auth_expiration: 3600,
-    }
+fn create_test_client(server_url: String) -> BlossomClient {
+    let signer = Signer::generate();
+    BlossomClient::new(vec![server_url], signer)
 }
 
 #[tokio::test]
 async fn test_blossom_client_upload() {
     let mock_server = MockServer::start().await;
-    let config = Config {
-        server_url: mock_server.uri(),
-        ..generate_test_config()
-    };
+    let client = create_test_client(mock_server.uri());
 
-    let client = BlossomClient::new(config.server_url).unwrap();
+    let data = b"hello world";
+    let hash = format!("{:x}", Sha256::digest(data));
 
-    // Mock upload endpoint
     Mock::given(method("PUT"))
         .and(path("/upload"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "sha256": "abc123",
-            "size": 11,
-            "url": "http://localhost:8080/abc123",
+            "sha256": hash,
+            "size": data.len(),
+            "url": format!("{}/{}", mock_server.uri(), hash),
             "uploaded": 1234567890
         })))
         .mount(&mock_server)
         .await;
 
-    let data = b"hello world".to_vec();
-    let sha256 = "abc123";
+    let result = client.upload(data, "application/octet-stream").await;
+    assert!(result.is_ok(), "Upload should succeed: {:?}", result.err());
 
-    let result = client.upload_blob(data, sha256, None, None).await;
-
-    assert!(result.is_ok(), "Upload should succeed");
     let descriptor = result.unwrap();
-    assert_eq!(descriptor.sha256, "abc123");
-    assert_eq!(descriptor.size, 11);
+    assert_eq!(descriptor.sha256, hash);
+    assert_eq!(descriptor.size, data.len() as u64);
 }
 
 #[tokio::test]
 async fn test_blossom_client_download() {
     let mock_server = MockServer::start().await;
-    let config = Config {
-        server_url: mock_server.uri(),
-        ..generate_test_config()
-    };
+    let client = create_test_client(mock_server.uri());
 
-    let client = BlossomClient::new(config.server_url).unwrap();
+    let test_data = b"test blob content";
+    let hash = format!("{:x}", Sha256::digest(test_data));
 
-    let test_data = b"test blob content".to_vec();
-
-    // Mock download endpoint
     Mock::given(method("GET"))
-        .and(path("/testhash123"))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(test_data.clone()))
+        .and(path(format!("/{}", hash)))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(test_data.to_vec()))
         .mount(&mock_server)
         .await;
 
-    let result = client.download_blob("testhash123", None).await;
-
-    assert!(result.is_ok(), "Download should succeed");
-    let downloaded = result.unwrap();
-    assert_eq!(downloaded, test_data);
+    let result = client.download(&hash).await;
+    assert!(result.is_ok(), "Download should succeed: {:?}", result.err());
+    assert_eq!(result.unwrap(), test_data.to_vec());
 }
 
 #[tokio::test]
-async fn test_blossom_client_has_blob() {
+async fn test_blossom_client_exists() {
     let mock_server = MockServer::start().await;
-    let config = Config {
-        server_url: mock_server.uri(),
-        ..generate_test_config()
-    };
+    let client = create_test_client(mock_server.uri());
 
-    let client = BlossomClient::new(config.server_url).unwrap();
-
-    // Mock HEAD endpoint - blob exists
     Mock::given(method("HEAD"))
-        .and(path("/exists"))
+        .and(path("/exists_hash"))
         .respond_with(ResponseTemplate::new(200))
         .mount(&mock_server)
         .await;
 
-    // Mock HEAD endpoint - blob doesn't exist
     Mock::given(method("HEAD"))
-        .and(path("/notexists"))
+        .and(path("/missing_hash"))
         .respond_with(ResponseTemplate::new(404))
         .mount(&mock_server)
         .await;
 
-    let exists = client.has_blob("exists", None).await.unwrap();
+    let exists = client.exists("exists_hash").await.unwrap();
     assert!(exists, "Should find existing blob");
 
-    let not_exists = client.has_blob("notexists", None).await.unwrap();
+    let not_exists = client.exists("missing_hash").await.unwrap();
     assert!(!not_exists, "Should not find non-existent blob");
 }
 
@@ -129,7 +99,6 @@ fn test_chunker_integration() {
     assert_eq!(size, 2048);
     assert_eq!(chunks.len(), 4, "Should have 4 chunks");
 
-    // All chunks except possibly the last should be chunk_size
     for chunk in &chunks[..chunks.len() - 1] {
         assert_eq!(chunk.size, 512);
     }
@@ -154,7 +123,6 @@ fn test_manifest_integration() {
     assert_eq!(manifest.chunks, 3);
     assert!(manifest.verify().unwrap());
 
-    // Test serialization roundtrip
     let json = manifest.to_json().unwrap();
     let parsed = Manifest::from_json(&json).unwrap();
     assert_eq!(parsed.merkle_root, manifest.merkle_root);

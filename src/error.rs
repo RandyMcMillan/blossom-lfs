@@ -5,8 +5,8 @@ pub enum BlossomLfsError {
     #[error("Configuration error: {0}")]
     Config(String),
 
-    #[error("HTTP error: {0}")]
-    Http(String),
+    #[error("Blossom client error: {0}")]
+    Blossom(String),
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
@@ -25,12 +25,6 @@ pub enum BlossomLfsError {
 
     #[error("Manifest not found for OID: {0}")]
     ManifestNotFound(String),
-
-    #[error("Nostr signing error: {0}")]
-    NostrSigning(String),
-
-    #[error("Invalid private key")]
-    InvalidPrivateKey,
 
     #[error("Upload failed: {0}")]
     UploadFailed(String),

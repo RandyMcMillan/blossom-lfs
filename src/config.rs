@@ -4,16 +4,14 @@ use std::path::PathBuf;
 const DEFAULT_CHUNK_SIZE: usize = 16 * 1024 * 1024;
 const DEFAULT_CONCURRENT_UPLOADS: usize = 8;
 const DEFAULT_CONCURRENT_DOWNLOADS: usize = 8;
-const DEFAULT_AUTH_EXPIRATION: u64 = 3600;
 
 #[derive(Debug, Clone)]
 pub struct Config {
     pub server_url: String,
-    pub secret_key: [u8; 32],
+    pub secret_key_hex: String,
     pub chunk_size: usize,
     pub max_concurrent_uploads: usize,
     pub max_concurrent_downloads: usize,
-    pub auth_expiration: u64,
 }
 
 impl Config {
@@ -40,7 +38,6 @@ impl Config {
         let mut chunk_size = DEFAULT_CHUNK_SIZE;
         let mut max_concurrent_uploads = DEFAULT_CONCURRENT_UPLOADS;
         let mut max_concurrent_downloads = DEFAULT_CONCURRENT_DOWNLOADS;
-        let mut auth_expiration = DEFAULT_AUTH_EXPIRATION;
 
         for line in content.lines() {
             let line = line.trim();
@@ -70,11 +67,6 @@ impl Config {
                             max_concurrent_downloads = v;
                         }
                     }
-                    "auth-expiration" | "authExpiration" => {
-                        if let Ok(v) = value.parse() {
-                            auth_expiration = v;
-                        }
-                    }
                     _ => {}
                 }
             }
@@ -87,15 +79,14 @@ impl Config {
             .or_else(|| std::env::var("NOSTR_PRIVATE_KEY").ok())
             .ok_or_else(|| anyhow::anyhow!("Missing private key"))?;
 
-        let secret_key = parse_secret_key(&private_key_str)?;
+        let secret_key_hex = normalize_to_hex(&private_key_str)?;
 
         Ok(Config {
             server_url,
-            secret_key,
+            secret_key_hex,
             chunk_size,
             max_concurrent_uploads,
             max_concurrent_downloads,
-            auth_expiration,
         })
     }
 
@@ -106,31 +97,34 @@ impl Config {
         let private_key_str = std::env::var("NOSTR_PRIVATE_KEY")
             .or_else(|_| anyhow::bail!("Missing NOSTR_PRIVATE_KEY environment variable"))?;
 
-        let secret_key = parse_secret_key(&private_key_str)?;
+        let secret_key_hex = normalize_to_hex(&private_key_str)?;
 
         Ok(Config {
             server_url,
-            secret_key,
+            secret_key_hex,
             chunk_size: DEFAULT_CHUNK_SIZE,
             max_concurrent_uploads: DEFAULT_CONCURRENT_UPLOADS,
             max_concurrent_downloads: DEFAULT_CONCURRENT_DOWNLOADS,
-            auth_expiration: DEFAULT_AUTH_EXPIRATION,
         })
     }
 }
 
-fn parse_secret_key(key: &str) -> Result<[u8; 32]> {
+/// Convert nsec or hex private key string to hex.
+fn normalize_to_hex(key: &str) -> Result<String> {
     let key = key.trim();
 
     if key.starts_with("nsec1") {
         let secret_key = nostr::SecretKey::parse(key)
             .map_err(|e| anyhow::anyhow!("Failed to parse nsec: {}", e))?;
-        Ok(secret_key.secret_bytes())
+        Ok(hex::encode(secret_key.secret_bytes()))
     } else {
-        hex::decode(key)
-            .map_err(|e| anyhow::anyhow!("Failed to decode hex: {}", e))?
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("Invalid secret key length: expected 32 bytes"))
+        // Validate it's valid hex and correct length
+        let bytes = hex::decode(key)
+            .map_err(|e| anyhow::anyhow!("Failed to decode hex: {}", e))?;
+        if bytes.len() != 32 {
+            anyhow::bail!("Invalid secret key length: expected 32 bytes");
+        }
+        Ok(key.to_string())
     }
 }
 
