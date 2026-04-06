@@ -1,12 +1,15 @@
+//! Error types for the blossom-lfs agent.
+
 use thiserror::Error;
 
+/// All errors that can occur during LFS transfer operations.
 #[derive(Error, Debug)]
 pub enum BlossomLfsError {
     #[error("Configuration error: {0}")]
     Config(String),
 
-    #[error("HTTP error: {0}")]
-    Http(String),
+    #[error("Blossom client error: {0}")]
+    Blossom(String),
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
@@ -25,12 +28,6 @@ pub enum BlossomLfsError {
 
     #[error("Manifest not found for OID: {0}")]
     ManifestNotFound(String),
-
-    #[error("Nostr signing error: {0}")]
-    NostrSigning(String),
-
-    #[error("Invalid private key")]
-    InvalidPrivateKey,
 
     #[error("Upload failed: {0}")]
     UploadFailed(String),
@@ -51,4 +48,5 @@ impl From<anyhow::Error> for BlossomLfsError {
     }
 }
 
+/// Convenience alias used throughout the crate.
 pub type Result<T> = std::result::Result<T, BlossomLfsError>;
