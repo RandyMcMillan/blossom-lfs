@@ -23,14 +23,11 @@ pub async fn run_daemon(port: u16) -> Result<()> {
 
     let app = Router::new()
         .route(
-            "/lfs/{repo_b64}/locks",
+            "/lfs/:repo_b64/locks",
             post(handle_create_lock).get(handle_list_locks),
         )
-        .route("/lfs/{repo_b64}/locks/verify", post(handle_verify_locks))
-        .route(
-            "/lfs/{repo_b64}/locks/{lock_id}/unlock",
-            post(handle_unlock),
-        )
+        .route("/lfs/:repo_b64/locks/verify", post(handle_verify_locks))
+        .route("/lfs/:repo_b64/locks/:lock_id/unlock", post(handle_unlock))
         .with_state(Arc::new(state));
 
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
