@@ -23,7 +23,7 @@ pub struct BlobDescriptor {
     pub uploaded: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct BlobStore {
     blobs: HashMap<String, Vec<u8>>,
 }

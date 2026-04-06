@@ -18,18 +18,13 @@ const DEFAULT_CONCURRENT_UPLOADS: usize = 8;
 const DEFAULT_CONCURRENT_DOWNLOADS: usize = 8;
 
 /// Which transport to use for blob operations.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum Transport {
     /// Standard HTTPS (default).
+    #[default]
     Http,
     /// iroh QUIC peer-to-peer transport (requires `iroh` feature).
     Iroh,
-}
-
-impl Default for Transport {
-    fn default() -> Self {
-        Self::Http
-    }
 }
 
 /// Runtime configuration for the LFS agent.
