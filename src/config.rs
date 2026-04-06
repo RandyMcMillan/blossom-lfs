@@ -17,10 +17,25 @@ const DEFAULT_CHUNK_SIZE: usize = 16 * 1024 * 1024;
 const DEFAULT_CONCURRENT_UPLOADS: usize = 8;
 const DEFAULT_CONCURRENT_DOWNLOADS: usize = 8;
 
+/// Which transport to use for blob operations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Transport {
+    /// Standard HTTPS (default).
+    Http,
+    /// iroh QUIC peer-to-peer transport (requires `iroh` feature).
+    Iroh,
+}
+
+impl Default for Transport {
+    fn default() -> Self {
+        Self::Http
+    }
+}
+
 /// Runtime configuration for the LFS agent.
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// Base URL of the Blossom server (e.g. `https://blossom.example.com`).
+    /// Base URL of the Blossom server (for HTTP) or iroh node ID (for iroh).
     pub server_url: String,
     /// Nostr private key as a 64-character hex string.
     pub secret_key_hex: String,
@@ -30,6 +45,8 @@ pub struct Config {
     pub max_concurrent_uploads: usize,
     /// Maximum number of concurrent chunk downloads.
     pub max_concurrent_downloads: usize,
+    /// Transport mode: `http` (default) or `iroh`.
+    pub transport: Transport,
 }
 
 impl Config {
@@ -60,6 +77,7 @@ impl Config {
         let mut chunk_size = DEFAULT_CHUNK_SIZE;
         let mut max_concurrent_uploads = DEFAULT_CONCURRENT_UPLOADS;
         let mut max_concurrent_downloads = DEFAULT_CONCURRENT_DOWNLOADS;
+        let mut transport = Transport::default();
 
         for line in content.lines() {
             let line = line.trim();
@@ -89,6 +107,9 @@ impl Config {
                             max_concurrent_downloads = v;
                         }
                     }
+                    "transport" => {
+                        transport = parse_transport(value);
+                    }
                     _ => {}
                 }
             }
@@ -109,6 +130,7 @@ impl Config {
             chunk_size,
             max_concurrent_uploads,
             max_concurrent_downloads,
+            transport,
         })
     }
 
@@ -121,13 +143,25 @@ impl Config {
 
         let secret_key_hex = normalize_to_hex(&private_key_str)?;
 
+        let transport = std::env::var("BLOSSOM_TRANSPORT")
+            .map(|v| parse_transport(&v))
+            .unwrap_or_default();
+
         Ok(Config {
             server_url,
             secret_key_hex,
             chunk_size: DEFAULT_CHUNK_SIZE,
             max_concurrent_uploads: DEFAULT_CONCURRENT_UPLOADS,
             max_concurrent_downloads: DEFAULT_CONCURRENT_DOWNLOADS,
+            transport,
         })
+    }
+}
+
+fn parse_transport(value: &str) -> Transport {
+    match value.trim().to_lowercase().as_str() {
+        "iroh" | "quic" => Transport::Iroh,
+        _ => Transport::Http,
     }
 }
 
@@ -157,5 +191,14 @@ mod tests {
     #[test]
     fn test_default_chunk_size() {
         assert_eq!(DEFAULT_CHUNK_SIZE, 16 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_parse_transport() {
+        assert_eq!(parse_transport("http"), Transport::Http);
+        assert_eq!(parse_transport("iroh"), Transport::Iroh);
+        assert_eq!(parse_transport("quic"), Transport::Iroh);
+        assert_eq!(parse_transport("IROH"), Transport::Iroh);
+        assert_eq!(parse_transport("anything_else"), Transport::Http);
     }
 }

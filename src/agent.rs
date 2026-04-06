@@ -8,12 +8,13 @@
 
 use crate::{
     chunking::{ChunkAssembler, Chunker, Manifest},
-    config::Config,
+    config::{Config, Transport},
     error::{BlossomLfsError, Result},
     protocol::{InitResponse, ProgressResponse, TransferResponse},
+    transport::{BlobTransport, HttpTransport},
 };
 use anyhow::Context as _;
-use blossom_rs::{auth::Signer, BlossomClient};
+use blossom_rs::auth::Signer;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -24,11 +25,12 @@ const TEMP_DIR: &str = ".blossom-lfs-tmp";
 /// The main transfer agent that handles Git LFS requests.
 ///
 /// Created once per process and reused across all transfers. Wraps a
-/// [`BlossomClient`] for server communication and a [`Chunker`] for splitting
-/// large files.
+/// [`BlobTransport`] for server communication and a [`Chunker`] for splitting
+/// large files. The transport is selected based on the `transport` config
+/// option (HTTP by default, iroh QUIC when enabled).
 pub struct Agent {
     config: Config,
-    client: Arc<BlossomClient>,
+    transport: Arc<dyn BlobTransport>,
     sender: tokio::sync::mpsc::Sender<String>,
     tasks: tokio::task::JoinSet<()>,
     chunker: Chunker,
@@ -38,22 +40,42 @@ pub struct Agent {
 impl Agent {
     /// Create a new agent from the given configuration.
     ///
-    /// Initialises the [`BlossomClient`] (with a 300-second timeout) and
-    /// the [`Chunker`]. Responses are sent through `sender`.
-    pub fn new(config: Config, sender: tokio::sync::mpsc::Sender<String>) -> Result<Self> {
+    /// Initialises the appropriate transport (HTTP or iroh) and the
+    /// [`Chunker`]. Responses are sent through `sender`.
+    pub async fn new(config: Config, sender: tokio::sync::mpsc::Sender<String>) -> Result<Self> {
         let signer = Signer::from_secret_hex(&config.secret_key_hex)
             .map_err(|e| BlossomLfsError::Config(format!("Failed to create signer: {}", e)))?;
-        let client = Arc::new(BlossomClient::with_timeout(
-            vec![config.server_url.clone()],
-            signer,
-            std::time::Duration::from_secs(300),
-        ));
+
+        let transport: Arc<dyn BlobTransport> = match config.transport {
+            Transport::Http => {
+                Arc::new(HttpTransport::new(
+                    config.server_url.clone(),
+                    signer,
+                    std::time::Duration::from_secs(300),
+                ))
+            }
+            Transport::Iroh => {
+                #[cfg(feature = "iroh")]
+                {
+                    Arc::new(create_iroh_transport(&config, signer).await?)
+                }
+                #[cfg(not(feature = "iroh"))]
+                {
+                    return Err(BlossomLfsError::Config(
+                        "iroh transport requested but the 'iroh' feature is not enabled. \
+                         Rebuild with: cargo build --features iroh"
+                            .to_string(),
+                    ));
+                }
+            }
+        };
+
         let chunker = Chunker::new(config.chunk_size)?;
         let temp_dir = PathBuf::from(TEMP_DIR);
 
         Ok(Self {
             config,
-            client,
+            transport,
             sender,
             tasks: tokio::task::JoinSet::new(),
             chunker,
@@ -86,7 +108,7 @@ impl Agent {
 
     async fn upload(&mut self, oid: String, path: String) {
         let config = self.config.clone();
-        let client = Arc::clone(&self.client);
+        let transport = Arc::clone(&self.transport);
         let sender = self.sender.clone();
         let chunker = self.chunker.clone();
 
@@ -105,14 +127,14 @@ impl Agent {
 
                 if chunked {
                     upload_chunked_file(
-                        &client, &config, &chunker, &file_path, file_size, &sender, &oid,
+                        transport.as_ref(), &config, &chunker, &file_path, file_size, &sender, &oid,
                     )
                     .await?;
                 }
 
                 // Upload the complete file so it's retrievable by OID,
                 // but skip if it already exists on the server
-                let already_exists = client
+                let already_exists = transport
                     .exists(&oid)
                     .await
                     .unwrap_or(false);
@@ -122,10 +144,9 @@ impl Agent {
                         .await
                         .context("Failed to read file")?;
 
-                    client
+                    transport
                         .upload(&data, "application/octet-stream")
-                        .await
-                        .map_err(BlossomLfsError::Blossom)?;
+                        .await?;
 
                     info!(blob.oid = %oid, blob.size = file_size, "blob uploaded");
                 } else {
@@ -151,7 +172,7 @@ impl Agent {
     }
 
     async fn download(&mut self, oid: String) {
-        let client = Arc::clone(&self.client);
+        let transport = Arc::clone(&self.transport);
         let sender = self.sender.clone();
         let temp_dir = self.temp_dir.clone();
         let config = self.config.clone();
@@ -162,10 +183,9 @@ impl Agent {
             let status: Result<Option<String>> = async {
                 send_progress(&sender, &oid, 0, 0, 0).await;
 
-                let blob_data: Vec<u8> = client
+                let blob_data = transport
                     .download(&oid)
-                    .await
-                    .map_err(BlossomLfsError::Blossom)?;
+                    .await?;
 
                 tokio::fs::create_dir_all(output_path.parent().unwrap())
                     .await
@@ -188,10 +208,9 @@ impl Agent {
                     send_progress(&sender, &oid, 0, total_size, 0).await;
 
                     if manifest.chunks == 1 {
-                        let chunk_data: Vec<u8> = client
+                        let chunk_data = transport
                             .download(&manifest.chunk_hashes[0])
-                            .await
-                            .map_err(BlossomLfsError::Blossom)?;
+                            .await?;
 
                         tokio::fs::write(&output_path, &chunk_data)
                             .await
@@ -200,7 +219,7 @@ impl Agent {
                         send_progress(&sender, &oid, total_size, total_size, total_size).await;
                     } else {
                         download_chunked_file(
-                            &client,
+                            transport.as_ref(),
                             &config,
                             &manifest,
                             &output_path,
@@ -242,9 +261,29 @@ impl Agent {
     }
 }
 
+/// Create an iroh transport from the config.
+///
+/// `server_url` is parsed as an iroh node ID (base32-encoded).
+#[cfg(feature = "iroh")]
+async fn create_iroh_transport(
+    config: &Config,
+    signer: Signer,
+) -> Result<crate::transport::IrohTransport> {
+    use crate::transport::IrohTransport;
+
+    let endpoint: iroh::endpoint::Endpoint = iroh::Endpoint::bind(iroh::endpoint::presets::N0)
+        .await
+        .map_err(|e| BlossomLfsError::Config(format!("failed to create iroh endpoint: {}", e)))?;
+
+    info!(iroh.node_id = %config.server_url, "connecting via iroh QUIC");
+
+    IrohTransport::new(endpoint, signer, &config.server_url)
+        .map_err(|e| BlossomLfsError::Config(e))
+}
+
 #[instrument(name = "lfs.upload.chunked", skip_all, fields(blob.oid = %oid, blob.size = file_size, blob.chunks = tracing::field::Empty, chunks.skipped = tracing::field::Empty))]
 async fn upload_chunked_file(
-    client: &BlossomClient,
+    transport: &dyn BlobTransport,
     _config: &Config,
     chunker: &Chunker,
     file_path: &Path,
@@ -267,16 +306,15 @@ async fn upload_chunked_file(
         let chunk_hash = hash_data(&chunk_data);
 
         // Skip upload if this chunk already exists on the server
-        let already_exists = client
+        let already_exists = transport
             .exists(&chunk_hash)
             .await
             .unwrap_or(false);
 
         if !already_exists {
-            client
+            transport
                 .upload(&chunk_data, "application/octet-stream")
-                .await
-                .map_err(BlossomLfsError::Blossom)?;
+                .await?;
             debug!(chunk.sha256 = %chunk_hash, chunk.size = chunk.size, chunk.index = chunk.index, "chunk uploaded");
         } else {
             skipped += 1;
@@ -297,7 +335,7 @@ async fn upload_chunked_file(
 
 #[instrument(name = "lfs.download.chunked", skip_all, fields(blob.oid = %oid, blob.size = manifest.file_size, blob.chunks = manifest.chunks))]
 async fn download_chunked_file(
-    client: &BlossomClient,
+    transport: &dyn BlobTransport,
     _config: &Config,
     manifest: &Manifest,
     output_path: &Path,
@@ -311,10 +349,9 @@ async fn download_chunked_file(
     let total_size = manifest.file_size as usize;
 
     for chunk_info in manifest.all_chunk_info()? {
-        let chunk_data: Vec<u8> = client
+        let chunk_data = transport
             .download(&chunk_info.hash)
-            .await
-            .map_err(BlossomLfsError::Blossom)?;
+            .await?;
 
         assembler
             .write_chunk(oid, chunk_info.index, &chunk_data)

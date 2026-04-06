@@ -45,12 +45,14 @@
 //!   environment variables.
 //! - [`error`] — Typed error definitions.
 //! - [`protocol`] — Git LFS custom transfer protocol message types.
+//! - [`transport`] — Pluggable transport layer (HTTP and optional iroh QUIC).
 
 pub mod agent;
 pub mod chunking;
 pub mod config;
 pub mod error;
 pub mod protocol;
+pub mod transport;
 
 pub use agent::Agent;
 pub use config::Config;

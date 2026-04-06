@@ -80,10 +80,12 @@ async fn run() -> anyhow::Result<()> {
         println!("    lfs-dal.chunk-size = 16777216 (default: 16MB)");
         println!("    lfs-dal.max-concurrent-uploads = 8 (default)");
         println!("    lfs-dal.max-concurrent-downloads = 8 (default)");
+        println!("    lfs-dal.transport = http (default; or 'iroh' for QUIC P2P)");
         println!();
         println!("  Or use environment variables:");
-        println!("    BLOSSOM_SERVER_URL = <blossom_server_url>");
+        println!("    BLOSSOM_SERVER_URL = <blossom_server_url or iroh_node_id>");
         println!("    NOSTR_PRIVATE_KEY = <nostr_private_key>");
+        println!("    BLOSSOM_TRANSPORT = http | iroh");
         return Ok(());
     }
 
@@ -91,8 +93,9 @@ async fn run() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("Failed to load configuration: {}", e))?;
 
     let (tx, mut rx) = tokio::sync::mpsc::channel(32);
-    let mut agent =
-        Agent::new(config, tx).map_err(|e| anyhow::anyhow!("Failed to initialize agent: {}", e))?;
+    let mut agent = Agent::new(config, tx)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to initialize agent: {}", e))?;
 
     tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
