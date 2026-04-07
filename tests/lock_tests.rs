@@ -9,7 +9,6 @@ use base64::Engine;
 use blossom_lfs::lock_client::LockClient;
 use blossom_rs::auth::Signer;
 use blossom_rs::BlossomSigner;
-use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;

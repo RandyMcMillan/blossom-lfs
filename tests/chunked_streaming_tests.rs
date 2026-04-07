@@ -321,7 +321,7 @@ async fn test_various_chunk_sizes() {
         let (chunks, size) = chunker.chunk_file(file.path()).await.unwrap();
         assert_eq!(size, 10_000);
 
-        let expected_chunks = (10_000 + cs - 1) / cs;
+        let expected_chunks = 10_000usize.div_ceil(cs);
         assert_eq!(
             chunks.len(),
             expected_chunks,

@@ -1,13 +1,11 @@
 use axum::{
-    body::Body,
     http::{header, StatusCode},
     response::IntoResponse,
-    routing::{get, post, put},
+    routing::{get, put},
     Json, Router,
 };
 use base64::Engine;
 use blossom_rs::auth::Signer;
-use blossom_rs::BlossomSigner;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
