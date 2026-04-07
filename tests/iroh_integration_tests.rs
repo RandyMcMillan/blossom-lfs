@@ -111,8 +111,6 @@ impl BlobBackend for SharedBackend {
 async fn test_dual_transport_iroh_upload_http_download() {
     let shared_mem: Arc<std::sync::Mutex<MemoryBackend>> =
         Arc::new(std::sync::Mutex::new(MemoryBackend::new()));
-
-    // --- HTTP server ---
     let http_server =
         BlobServer::builder(SharedBackend::new(shared_mem.clone()), "http://localhost:0")
             .database(MemoryDatabase::new())
@@ -124,7 +122,6 @@ async fn test_dual_transport_iroh_upload_http_download() {
     tokio::spawn(async move { axum::serve(http_listener, app).await.ok() });
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-    // --- iroh server (same backend) ---
     let iroh_state = Arc::new(Mutex::new(IrohState {
         backend: Box::new(SharedBackend::new(shared_mem.clone())),
         database: Box::new(MemoryDatabase::new()),
@@ -145,7 +142,6 @@ async fn test_dual_transport_iroh_upload_http_download() {
         .spawn();
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    // --- Daemon with dual transport ---
     let signer = Signer::generate();
     let endpoint_id_str = iroh_addr.id.to_string();
     let repo_dir = setup_git_repo_dual(&http_url, &endpoint_id_str, &signer.secret_key_hex());
@@ -160,7 +156,6 @@ async fn test_dual_transport_iroh_upload_http_download() {
     let data: Vec<u8> = (0..5000).map(|i| (i % 256) as u8).collect();
     let oid = sha256_hex(&data);
 
-    // Upload (routes to iroh by default in dual mode)
     let resp = http
         .put(format!("{}/lfs/{}/objects/{}", daemon_url, repo_b64, oid))
         .body(data.clone())
@@ -169,7 +164,6 @@ async fn test_dual_transport_iroh_upload_http_download() {
         .unwrap();
     assert_eq!(resp.status(), 200, "dual-transport upload should succeed");
 
-    // Download (routes to HTTP by default in dual mode)
     let resp = http
         .get(format!("{}/lfs/{}/objects/{}", daemon_url, repo_b64, oid))
         .send()
@@ -181,6 +175,53 @@ async fn test_dual_transport_iroh_upload_http_download() {
         &downloaded[..],
         &data[..],
         "dual-transport round-trip content mismatch"
+    );
+}
+
+/// BUD-20 compression round-trip via iroh-only daemon. The daemon sends LFS
+/// tags in the upload, the iroh server compresses, and on download the server
+/// decompresses transparently. Verifies byte-for-byte identity.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_iroh_bud20_compressed_roundtrip() {
+    let (server_addr, _router) = spawn_iroh_lfs_server().await;
+    let signer = Signer::generate();
+
+    let endpoint_id_str = server_addr.id.to_string();
+    let repo_dir = setup_git_repo_iroh_only(&endpoint_id_str, &signer.secret_key_hex());
+    let repo_b64 = repo_b64(repo_dir.path());
+
+    let daemon_port = find_port().await;
+    spawn_lfs_daemon(daemon_port).await;
+
+    let daemon_url = format!("http://127.0.0.1:{}", daemon_port);
+    let http = reqwest::Client::new();
+
+    // Highly compressible data — server will apply zstd
+    let data: Vec<u8> = vec![42u8; 10_000];
+    let oid = sha256_hex(&data);
+
+    // Upload via daemon → iroh server (compresses internally)
+    let resp = http
+        .put(format!("{}/lfs/{}/objects/{}", daemon_url, repo_b64, oid))
+        .body(data.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "BUD-20 upload should succeed");
+
+    // Download via daemon → iroh server (decompresses transparently)
+    let resp = http
+        .get(format!("{}/lfs/{}/objects/{}", daemon_url, repo_b64, oid))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "BUD-20 download should succeed");
+    let downloaded = resp.bytes().await.unwrap();
+    assert_eq!(downloaded.len(), data.len(), "size should match original");
+    assert_eq!(
+        &downloaded[..],
+        &data[..],
+        "BUD-20 round-trip content mismatch"
     );
 }
 
@@ -480,4 +521,79 @@ async fn test_iroh_multiple_blobs() {
             i
         );
     }
+}
+
+/// User A creates a lock. User B cannot unlock (403), but can force-unlock.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_iroh_lock_force_unlock_by_other_user() {
+    let (server_addr, _router) = spawn_iroh_lfs_server().await;
+    let signer_a = Signer::generate();
+    let signer_b = Signer::generate();
+
+    let endpoint_id_str = server_addr.id.to_string();
+
+    // User A's repo
+    let repo_dir_a = setup_git_repo_iroh_only(&endpoint_id_str, &signer_a.secret_key_hex());
+    let repo_b64_a = repo_b64(repo_dir_a.path());
+
+    // User B's repo (same iroh endpoint, different signer)
+    let repo_dir_b = setup_git_repo_iroh_only(&endpoint_id_str, &signer_b.secret_key_hex());
+    let repo_b64_b = repo_b64(repo_dir_b.path());
+
+    let daemon_port = find_port().await;
+    spawn_lfs_daemon(daemon_port).await;
+
+    let daemon_url = format!("http://127.0.0.1:{}", daemon_port);
+    let http = reqwest::Client::new();
+
+    // User A creates a lock
+    let resp = http
+        .post(format!("{}/lfs/{}/locks", daemon_url, repo_b64_a))
+        .json(&serde_json::json!({"path": "protected.bin"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "user A lock create should succeed");
+    let lock_resp: serde_json::Value = resp.json().await.unwrap();
+    let lock_id = lock_resp["lock"]["id"].as_str().unwrap().to_string();
+
+    // User B tries to unlock without force — should fail
+    let resp = http
+        .post(format!(
+            "{}/lfs/{}/locks/{}/unlock",
+            daemon_url, repo_b64_b, lock_id
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        403,
+        "user B unlock without force should be forbidden"
+    );
+
+    // User B force-unlocks — should succeed
+    let resp = http
+        .post(format!(
+            "{}/lfs/{}/locks/{}/unlock",
+            daemon_url, repo_b64_b, lock_id
+        ))
+        .json(&serde_json::json!({"force": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "user B force unlock should succeed");
+
+    // Verify lock is gone
+    let resp = http
+        .get(format!("{}/lfs/{}/locks", daemon_url, repo_b64_a))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let locks: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        locks["locks"].as_array().unwrap().is_empty(),
+        "lock should be gone after force unlock"
+    );
 }
