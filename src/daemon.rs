@@ -514,8 +514,19 @@ async fn handle_upload(
 
     let already_exists = transport.exists(&oid).await.unwrap_or(false);
     if !already_exists {
+        let repo_slug = match derive_repo_slug(&repo_path).await {
+            Ok(s) => s,
+            Err(_) => "unknown".to_string(),
+        };
         if let Err(e) = transport
-            .upload_file(file_path, "application/octet-stream")
+            .upload_lfs(
+                &std::fs::read(&tmp_file).unwrap_or_default(),
+                "application/octet-stream",
+                &oid,
+                &repo_slug,
+                None,
+                false,
+            )
             .await
         {
             tokio::fs::remove_file(&tmp_file).await.ok();

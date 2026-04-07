@@ -121,4 +121,31 @@ impl Transport {
         }
         .map_err(BlossomLfsError::Blossom)
     }
+
+    /// Upload a blob with LFS context tags (BUD-20).
+    ///
+    /// Sends `["t","lfs"]`, `["path",...]`, `["repo",...]`, and optionally
+    /// `["base",...]` and `["manifest"]` tags in the auth event.
+    pub async fn upload_lfs(
+        &self,
+        data: &[u8],
+        content_type: &str,
+        path: &str,
+        repo: &str,
+        base_sha256: Option<&str>,
+        is_manifest: bool,
+    ) -> Result<BlobDescriptor> {
+        match self {
+            Self::Http(c) => {
+                c.upload_lfs(data, content_type, path, repo, base_sha256, is_manifest)
+                    .await
+            }
+            #[cfg(feature = "iroh")]
+            Self::Iroh { .. } => {
+                // iroh transport doesn't support LFS tags yet; fall back to regular upload
+                self.upload(data, content_type).await
+            }
+        }
+        .map_err(BlossomLfsError::Blossom)
+    }
 }
