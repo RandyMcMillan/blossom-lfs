@@ -262,6 +262,45 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_config_basic() {
+        let config = Config::parse_config(
+            "server=https://blossom.example.com\n\
+             private-key=0000000000000000000000000000000000000000000000000000000000000001",
+        )
+        .unwrap();
+        assert_eq!(
+            config.server_url,
+            Some("https://blossom.example.com".to_string())
+        );
+        assert!(config.iroh_endpoint.is_none());
+        assert!(config.force_transport.is_none());
+        assert_eq!(config.chunk_size, DEFAULT_CHUNK_SIZE);
+        assert_eq!(config.max_concurrent_uploads, DEFAULT_CONCURRENT_UPLOADS);
+        assert_eq!(
+            config.max_concurrent_downloads,
+            DEFAULT_CONCURRENT_DOWNLOADS
+        );
+        assert_eq!(config.daemon_port, DEFAULT_DAEMON_PORT);
+    }
+
+    #[test]
+    fn test_parse_config_custom_values() {
+        let config = Config::parse_config(
+            "server=https://blossom.example.com\n\
+             private-key=0000000000000000000000000000000000000000000000000000000000000001\n\
+             chunk-size=4096\n\
+             max-concurrent-uploads=4\n\
+             max-concurrent-downloads=2\n\
+             daemon-port=9999",
+        )
+        .unwrap();
+        assert_eq!(config.chunk_size, 4096);
+        assert_eq!(config.max_concurrent_uploads, 4);
+        assert_eq!(config.max_concurrent_downloads, 2);
+        assert_eq!(config.daemon_port, 9999);
+    }
+
+    #[test]
     fn test_parse_config_with_iroh_endpoint() {
         let config = Config::parse_config(
             "server=https://blossom.example.com\n\
@@ -327,5 +366,134 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("Missing server URL"));
+    }
+
+    #[test]
+    fn test_parse_config_missing_private_key() {
+        let result = Config::parse_config("server=https://blossom.example.com");
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Missing private key"));
+    }
+
+    #[test]
+    fn test_parse_config_comments_and_sections() {
+        let config = Config::parse_config(
+            "# this is a comment\n\
+             [lfs-dal]\n\
+             \n\
+             server=https://blossom.example.com\n\
+             private-key=0000000000000000000000000000000000000000000000000000000000000001",
+        )
+        .unwrap();
+        assert_eq!(
+            config.server_url,
+            Some("https://blossom.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_config_quoted_values() {
+        let config = Config::parse_config(
+            "server=\"https://blossom.example.com\"\n\
+             private-key=0000000000000000000000000000000000000000000000000000000000000001",
+        )
+        .unwrap();
+        assert_eq!(
+            config.server_url,
+            Some("https://blossom.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_config_unknown_keys_ignored() {
+        let config = Config::parse_config(
+            "server=https://blossom.example.com\n\
+             private-key=0000000000000000000000000000000000000000000000000000000000000001\n\
+             unknown-key=some-value",
+        )
+        .unwrap();
+        assert_eq!(
+            config.server_url,
+            Some("https://blossom.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_normalize_hex_key() {
+        let hex = "0000000000000000000000000000000000000000000000000000000000000001";
+        let result = normalize_to_hex(hex).unwrap();
+        assert_eq!(result, hex);
+    }
+
+    #[test]
+    fn test_normalize_hex_key_whitespace() {
+        let hex = " 0000000000000000000000000000000000000000000000000000000000000001 ";
+        let result = normalize_to_hex(hex).unwrap();
+        assert_eq!(result, hex.trim());
+    }
+
+    #[test]
+    fn test_normalize_invalid_hex() {
+        let result = normalize_to_hex("not-hex-at-all-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_normalize_short_hex() {
+        let result = normalize_to_hex("abcd");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_config_camel_case_keys() {
+        let config = Config::parse_config(
+            "server=https://blossom.example.com\n\
+             privateKey=0000000000000000000000000000000000000000000000000000000000000001\n\
+             chunkSize=4096\n\
+             maxConcurrentUploads=2\n\
+             maxConcurrentDownloads=4\n\
+             irohEndpoint=testep\n\
+             daemonPort=8080",
+        )
+        .unwrap();
+        assert_eq!(config.chunk_size, 4096);
+        assert_eq!(config.max_concurrent_uploads, 2);
+        assert_eq!(config.max_concurrent_downloads, 4);
+        assert_eq!(config.iroh_endpoint.as_deref(), Some("testep"));
+        assert_eq!(config.daemon_port, 8080);
+    }
+
+    #[test]
+    fn test_parse_config_invalid_chunk_size_uses_default() {
+        let config = Config::parse_config(
+            "server=https://blossom.example.com\n\
+             private-key=0000000000000000000000000000000000000000000000000000000000000001\n\
+             chunk-size=not-a-number",
+        )
+        .unwrap();
+        assert_eq!(config.chunk_size, DEFAULT_CHUNK_SIZE);
+    }
+
+    #[test]
+    fn test_from_repo_path_lfsdalconfig() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".lfsdalconfig"),
+            "server=https://example.com\nprivate-key=0000000000000000000000000000000000000000000000000000000000000001",
+        )
+        .unwrap();
+
+        let config = Config::from_repo_path(dir.path()).unwrap();
+        assert_eq!(config.server_url, Some("https://example.com".to_string()));
+    }
+
+    #[test]
+    fn test_from_repo_path_no_config_falls_to_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = Config::from_repo_path(dir.path());
+        assert!(result.is_err());
     }
 }
