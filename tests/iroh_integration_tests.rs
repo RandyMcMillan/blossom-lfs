@@ -1,7 +1,7 @@
 //! Iroh transport integration tests for blossom-lfs daemon.
 //!
-//! Tests iroh-only mode: the daemon talks directly to a blossom-rs iroh
-//! QUIC server without any HTTP intermediary.
+//! Tests iroh-only mode and dual-transport mode (iroh upload + HTTP download)
+//! with shared backend storage.
 
 #![cfg(feature = "iroh")]
 
@@ -10,7 +10,9 @@ use blossom_rs::access::OpenAccess;
 use blossom_rs::auth::Signer;
 use blossom_rs::db::MemoryDatabase;
 use blossom_rs::locks::MemoryLockDatabase;
-use blossom_rs::storage::MemoryBackend;
+use blossom_rs::protocol::BlobDescriptor;
+use blossom_rs::server::BlobServer;
+use blossom_rs::storage::{BlobBackend, MemoryBackend};
 use blossom_rs::transport::{BlossomProtocol, IrohState, BLOSSOM_ALPN};
 use blossom_rs::MemoryLfsVersionDatabase;
 use iroh::endpoint::presets::N0;
@@ -25,6 +27,161 @@ fn sha256_hex(data: &[u8]) -> String {
 
 fn repo_b64(repo_path: &std::path::Path) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(repo_path.to_string_lossy().as_bytes())
+}
+
+fn setup_git_repo_dual(
+    server_url: &str,
+    endpoint_id_str: &str,
+    nsec_hex: &str,
+) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_path = dir.path();
+
+    std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(repo_path)
+        .output()
+        .expect("git init failed");
+
+    std::process::Command::new("git")
+        .args(["remote", "add", "origin", "https://myrepo"])
+        .current_dir(repo_path)
+        .output()
+        .expect("git remote add failed");
+
+    let config = format!(
+        "server={}\niroh-endpoint={}\nprivate-key={}",
+        server_url, endpoint_id_str, nsec_hex
+    );
+    std::fs::write(repo_path.join(".lfsdalconfig"), config).unwrap();
+
+    dir
+}
+
+struct SharedBackend {
+    inner: Arc<std::sync::Mutex<MemoryBackend>>,
+}
+
+impl SharedBackend {
+    fn new(inner: Arc<std::sync::Mutex<MemoryBackend>>) -> Self {
+        Self { inner }
+    }
+}
+
+impl BlobBackend for SharedBackend {
+    fn insert(&mut self, data: Vec<u8>, base_url: &str) -> BlobDescriptor {
+        self.inner.lock().unwrap().insert(data, base_url)
+    }
+
+    fn insert_with_hash(
+        &mut self,
+        data: Vec<u8>,
+        hash: &str,
+        original_size: u64,
+        base_url: &str,
+    ) -> BlobDescriptor {
+        self.inner
+            .lock()
+            .unwrap()
+            .insert_with_hash(data, hash, original_size, base_url)
+    }
+
+    fn get(&self, sha256: &str) -> Option<Vec<u8>> {
+        self.inner.lock().unwrap().get(sha256)
+    }
+
+    fn exists(&self, sha256: &str) -> bool {
+        self.inner.lock().unwrap().exists(sha256)
+    }
+
+    fn delete(&mut self, sha256: &str) -> bool {
+        self.inner.lock().unwrap().delete(sha256)
+    }
+
+    fn len(&self) -> usize {
+        self.inner.lock().unwrap().len()
+    }
+
+    fn total_bytes(&self) -> u64 {
+        self.inner.lock().unwrap().total_bytes()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_dual_transport_iroh_upload_http_download() {
+    let shared_mem: Arc<std::sync::Mutex<MemoryBackend>> =
+        Arc::new(std::sync::Mutex::new(MemoryBackend::new()));
+
+    // --- HTTP server ---
+    let http_server =
+        BlobServer::builder(SharedBackend::new(shared_mem.clone()), "http://localhost:0")
+            .database(MemoryDatabase::new())
+            .build();
+    let app = http_server.router();
+    let http_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let http_addr = http_listener.local_addr().unwrap();
+    let http_url = format!("http://{}", http_addr);
+    tokio::spawn(async move { axum::serve(http_listener, app).await.ok() });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // --- iroh server (same backend) ---
+    let iroh_state = Arc::new(Mutex::new(IrohState {
+        backend: Box::new(SharedBackend::new(shared_mem.clone())),
+        database: Box::new(MemoryDatabase::new()),
+        access: Box::new(OpenAccess),
+        base_url: "iroh://test".to_string(),
+        max_upload_size: None,
+        require_auth: false,
+        lock_db: None,
+        lfs_version_db: None,
+    }));
+    let iroh_endpoint = iroh::Endpoint::builder(N0)
+        .bind()
+        .await
+        .expect("bind iroh endpoint");
+    let iroh_addr = iroh_endpoint.addr();
+    let _iroh_router = Router::builder(iroh_endpoint)
+        .accept(BLOSSOM_ALPN, Arc::new(BlossomProtocol::new(iroh_state)))
+        .spawn();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // --- Daemon with dual transport ---
+    let signer = Signer::generate();
+    let endpoint_id_str = iroh_addr.id.to_string();
+    let repo_dir = setup_git_repo_dual(&http_url, &endpoint_id_str, &signer.secret_key_hex());
+    let repo_b64 = repo_b64(repo_dir.path());
+
+    let daemon_port = find_port().await;
+    spawn_lfs_daemon(daemon_port).await;
+
+    let daemon_url = format!("http://127.0.0.1:{}", daemon_port);
+    let http = reqwest::Client::new();
+
+    let data: Vec<u8> = (0..5000).map(|i| (i % 256) as u8).collect();
+    let oid = sha256_hex(&data);
+
+    // Upload (routes to iroh by default in dual mode)
+    let resp = http
+        .put(format!("{}/lfs/{}/objects/{}", daemon_url, repo_b64, oid))
+        .body(data.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "dual-transport upload should succeed");
+
+    // Download (routes to HTTP by default in dual mode)
+    let resp = http
+        .get(format!("{}/lfs/{}/objects/{}", daemon_url, repo_b64, oid))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "dual-transport download should succeed");
+    let downloaded = resp.bytes().await.unwrap();
+    assert_eq!(
+        &downloaded[..],
+        &data[..],
+        "dual-transport round-trip content mismatch"
+    );
 }
 
 fn setup_git_repo_iroh_only(endpoint_id_str: &str, nsec_hex: &str) -> tempfile::TempDir {
