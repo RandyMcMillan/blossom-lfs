@@ -16,22 +16,20 @@ use std::path::PathBuf;
 const DEFAULT_CHUNK_SIZE: usize = 16 * 1024 * 1024;
 const DEFAULT_CONCURRENT_UPLOADS: usize = 8;
 const DEFAULT_CONCURRENT_DOWNLOADS: usize = 8;
-
-/// Which transport to use for blob operations.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub enum Transport {
-    /// Standard HTTPS (default).
-    #[default]
-    Http,
-    /// iroh QUIC peer-to-peer transport (requires `iroh` feature).
-    Iroh,
-}
+const DEFAULT_DAEMON_PORT: u16 = 31921;
 
 /// Runtime configuration for the LFS agent.
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// Base URL of the Blossom server (for HTTP) or iroh node ID (for iroh).
-    pub server_url: String,
+    /// HTTP URL of the Blossom server.
+    ///
+    /// Optional when `force_transport = iroh` and `iroh_endpoint` is set
+    /// (iroh-only mode). Required otherwise.
+    pub server_url: Option<String>,
+    /// Optional iroh endpoint ID (base32-encoded). When set alongside
+    /// `server_url`, the daemon uses iroh for uploads and HTTP for downloads
+    /// with automatic fallback.
+    pub iroh_endpoint: Option<String>,
     /// Nostr private key as a 64-character hex string.
     pub secret_key_hex: String,
     /// Maximum bytes per chunk (default 16 MiB).
@@ -40,8 +38,20 @@ pub struct Config {
     pub max_concurrent_uploads: usize,
     /// Maximum number of concurrent chunk downloads.
     pub max_concurrent_downloads: usize,
-    /// Transport mode: `http` (default) or `iroh`.
-    pub transport: Transport,
+    /// Force all operations through a single transport.
+    /// Without this, iroh is preferred for uploads and HTTP for downloads.
+    pub force_transport: Option<ForceTransport>,
+    /// Daemon port for lock proxy (default 31921).
+    pub daemon_port: u16,
+}
+
+/// Force a specific transport for all operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForceTransport {
+    /// Force all operations through HTTP.
+    Http,
+    /// Force all operations through iroh.
+    Iroh,
 }
 
 impl Config {
@@ -66,13 +76,41 @@ impl Config {
         Self::from_env()
     }
 
+    /// Load configuration from a specific repo directory path.
+    ///
+    /// Looks for `.lfsdalconfig` and `.git/config` in the given directory.
+    /// Used by the daemon to load per-repo config.
+    pub fn from_repo_path(repo_path: &std::path::Path) -> Result<Self> {
+        let lfsdalconfig = repo_path.join(".lfsdalconfig");
+        if lfsdalconfig.exists() {
+            let content = std::fs::read_to_string(&lfsdalconfig)
+                .with_context(|| format!("Failed to read config: {:?}", lfsdalconfig))?;
+            if let Ok(config) = Self::parse_config(&content) {
+                return Ok(config);
+            }
+        }
+
+        let git_config = repo_path.join(".git/config");
+        if git_config.exists() {
+            let content = std::fs::read_to_string(&git_config)
+                .with_context(|| format!("Failed to read config: {:?}", git_config))?;
+            if let Ok(config) = Self::parse_config(&content) {
+                return Ok(config);
+            }
+        }
+
+        Self::from_env()
+    }
+
     fn parse_config(content: &str) -> Result<Self> {
         let mut server_url = None;
+        let mut iroh_endpoint = None;
         let mut private_key_str = None;
         let mut chunk_size = DEFAULT_CHUNK_SIZE;
         let mut max_concurrent_uploads = DEFAULT_CONCURRENT_UPLOADS;
         let mut max_concurrent_downloads = DEFAULT_CONCURRENT_DOWNLOADS;
-        let mut transport = Transport::default();
+        let mut force_transport: Option<ForceTransport> = None;
+        let mut daemon_port = DEFAULT_DAEMON_PORT;
 
         for line in content.lines() {
             let line = line.trim();
@@ -86,6 +124,9 @@ impl Config {
 
                 match key {
                     "server" => server_url = Some(value.to_string()),
+                    "iroh-endpoint" | "irohEndpoint" => {
+                        iroh_endpoint = Some(value.to_string());
+                    }
                     "private-key" | "privateKey" => private_key_str = Some(value.to_string()),
                     "chunk-size" | "chunkSize" => {
                         if let Ok(v) = value.parse() {
@@ -103,15 +144,33 @@ impl Config {
                         }
                     }
                     "transport" => {
-                        transport = parse_transport(value);
+                        let v = value.trim().to_lowercase();
+                        match v.as_str() {
+                            "iroh" | "quic" => {
+                                force_transport = Some(ForceTransport::Iroh);
+                            }
+                            "http" | "https" => {
+                                force_transport = Some(ForceTransport::Http);
+                            }
+                            _ => {}
+                        }
+                    }
+                    "daemon-port" | "daemonPort" => {
+                        if let Ok(v) = value.parse() {
+                            daemon_port = v;
+                        }
                     }
                     _ => {}
                 }
             }
         }
 
-        let server_url =
-            server_url.ok_or_else(|| anyhow::anyhow!("Missing server URL in config"))?;
+        let is_iroh_only = force_transport == Some(ForceTransport::Iroh) && iroh_endpoint.is_some();
+        let server_url = if is_iroh_only {
+            server_url
+        } else {
+            Some(server_url.ok_or_else(|| anyhow::anyhow!("Missing server URL in config"))?)
+        };
 
         let private_key_str = private_key_str
             .or_else(|| std::env::var("NOSTR_PRIVATE_KEY").ok())
@@ -121,46 +180,61 @@ impl Config {
 
         Ok(Config {
             server_url,
+            iroh_endpoint,
             secret_key_hex,
             chunk_size,
             max_concurrent_uploads,
             max_concurrent_downloads,
-            transport,
+            force_transport,
+            daemon_port,
         })
     }
 
     fn from_env() -> Result<Self> {
-        let server_url = std::env::var("BLOSSOM_SERVER_URL")
-            .or_else(|_| anyhow::bail!("Missing BLOSSOM_SERVER_URL environment variable"))?;
+        let server_url_env = std::env::var("BLOSSOM_SERVER_URL").ok();
 
         let private_key_str = std::env::var("NOSTR_PRIVATE_KEY")
             .or_else(|_| anyhow::bail!("Missing NOSTR_PRIVATE_KEY environment variable"))?;
 
         let secret_key_hex = normalize_to_hex(&private_key_str)?;
 
-        let transport = std::env::var("BLOSSOM_TRANSPORT")
-            .map(|v| parse_transport(&v))
-            .unwrap_or_default();
+        let iroh_endpoint = std::env::var("BLOSSOM_IROH_ENDPOINT").ok();
+
+        let force_transport = std::env::var("BLOSSOM_TRANSPORT").ok().and_then(|v| {
+            match v.trim().to_lowercase().as_str() {
+                "iroh" | "quic" => Some(ForceTransport::Iroh),
+                "http" | "https" => Some(ForceTransport::Http),
+                _ => None,
+            }
+        });
+
+        let daemon_port = std::env::var("BLOSSOM_DAEMON_PORT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_DAEMON_PORT);
+
+        let is_iroh_only = force_transport == Some(ForceTransport::Iroh) && iroh_endpoint.is_some();
+        let server_url = if is_iroh_only {
+            server_url_env
+        } else {
+            Some(server_url_env.ok_or_else(|| {
+                anyhow::anyhow!("Missing BLOSSOM_SERVER_URL environment variable")
+            })?)
+        };
 
         Ok(Config {
             server_url,
+            iroh_endpoint,
             secret_key_hex,
             chunk_size: DEFAULT_CHUNK_SIZE,
             max_concurrent_uploads: DEFAULT_CONCURRENT_UPLOADS,
             max_concurrent_downloads: DEFAULT_CONCURRENT_DOWNLOADS,
-            transport,
+            force_transport,
+            daemon_port,
         })
     }
 }
 
-fn parse_transport(value: &str) -> Transport {
-    match value.trim().to_lowercase().as_str() {
-        "iroh" | "quic" => Transport::Iroh,
-        _ => Transport::Http,
-    }
-}
-
-/// Convert nsec or hex private key string to hex.
 fn normalize_to_hex(key: &str) -> Result<String> {
     let key = key.trim();
 
@@ -188,11 +262,238 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_transport() {
-        assert_eq!(parse_transport("http"), Transport::Http);
-        assert_eq!(parse_transport("iroh"), Transport::Iroh);
-        assert_eq!(parse_transport("quic"), Transport::Iroh);
-        assert_eq!(parse_transport("IROH"), Transport::Iroh);
-        assert_eq!(parse_transport("anything_else"), Transport::Http);
+    fn test_parse_config_basic() {
+        let config = Config::parse_config(
+            "server=https://blossom.example.com\n\
+             private-key=0000000000000000000000000000000000000000000000000000000000000001",
+        )
+        .unwrap();
+        assert_eq!(
+            config.server_url,
+            Some("https://blossom.example.com".to_string())
+        );
+        assert!(config.iroh_endpoint.is_none());
+        assert!(config.force_transport.is_none());
+        assert_eq!(config.chunk_size, DEFAULT_CHUNK_SIZE);
+        assert_eq!(config.max_concurrent_uploads, DEFAULT_CONCURRENT_UPLOADS);
+        assert_eq!(
+            config.max_concurrent_downloads,
+            DEFAULT_CONCURRENT_DOWNLOADS
+        );
+        assert_eq!(config.daemon_port, DEFAULT_DAEMON_PORT);
+    }
+
+    #[test]
+    fn test_parse_config_custom_values() {
+        let config = Config::parse_config(
+            "server=https://blossom.example.com\n\
+             private-key=0000000000000000000000000000000000000000000000000000000000000001\n\
+             chunk-size=4096\n\
+             max-concurrent-uploads=4\n\
+             max-concurrent-downloads=2\n\
+             daemon-port=9999",
+        )
+        .unwrap();
+        assert_eq!(config.chunk_size, 4096);
+        assert_eq!(config.max_concurrent_uploads, 4);
+        assert_eq!(config.max_concurrent_downloads, 2);
+        assert_eq!(config.daemon_port, 9999);
+    }
+
+    #[test]
+    fn test_parse_config_with_iroh_endpoint() {
+        let config = Config::parse_config(
+            "server=https://blossom.example.com\n\
+             iroh-endpoint=abc123def456\n\
+             private-key=0000000000000000000000000000000000000000000000000000000000000001",
+        )
+        .unwrap();
+        assert_eq!(
+            config.server_url,
+            Some("https://blossom.example.com".to_string())
+        );
+        assert_eq!(config.iroh_endpoint.as_deref(), Some("abc123def456"));
+        assert!(config.force_transport.is_none());
+    }
+
+    #[test]
+    fn test_parse_config_transport_iroh_legacy() {
+        let config = Config::parse_config(
+            "server=https://blossom.example.com\n\
+             transport=iroh\n\
+             private-key=0000000000000000000000000000000000000000000000000000000000000001",
+        )
+        .unwrap();
+        assert_eq!(config.force_transport, Some(ForceTransport::Iroh));
+        assert_eq!(
+            config.server_url,
+            Some("https://blossom.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_config_force_http() {
+        let config = Config::parse_config(
+            "server=https://blossom.example.com\n\
+             iroh-endpoint=abc123\n\
+             transport=http\n\
+             private-key=0000000000000000000000000000000000000000000000000000000000000001",
+        )
+        .unwrap();
+        assert_eq!(config.force_transport, Some(ForceTransport::Http));
+    }
+
+    #[test]
+    fn test_parse_config_iroh_only_no_server() {
+        let config = Config::parse_config(
+            "iroh-endpoint=abc123\n\
+             transport=iroh\n\
+             private-key=0000000000000000000000000000000000000000000000000000000000000001",
+        )
+        .unwrap();
+        assert_eq!(config.force_transport, Some(ForceTransport::Iroh));
+        assert_eq!(config.iroh_endpoint.as_deref(), Some("abc123"));
+        assert!(config.server_url.is_none());
+    }
+
+    #[test]
+    fn test_parse_config_missing_server_no_iroh() {
+        let result = Config::parse_config(
+            "private-key=0000000000000000000000000000000000000000000000000000000000000001",
+        );
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Missing server URL"));
+    }
+
+    #[test]
+    fn test_parse_config_missing_private_key() {
+        let result = Config::parse_config("server=https://blossom.example.com");
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Missing private key"));
+    }
+
+    #[test]
+    fn test_parse_config_comments_and_sections() {
+        let config = Config::parse_config(
+            "# this is a comment\n\
+             [lfs-dal]\n\
+             \n\
+             server=https://blossom.example.com\n\
+             private-key=0000000000000000000000000000000000000000000000000000000000000001",
+        )
+        .unwrap();
+        assert_eq!(
+            config.server_url,
+            Some("https://blossom.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_config_quoted_values() {
+        let config = Config::parse_config(
+            "server=\"https://blossom.example.com\"\n\
+             private-key=0000000000000000000000000000000000000000000000000000000000000001",
+        )
+        .unwrap();
+        assert_eq!(
+            config.server_url,
+            Some("https://blossom.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_config_unknown_keys_ignored() {
+        let config = Config::parse_config(
+            "server=https://blossom.example.com\n\
+             private-key=0000000000000000000000000000000000000000000000000000000000000001\n\
+             unknown-key=some-value",
+        )
+        .unwrap();
+        assert_eq!(
+            config.server_url,
+            Some("https://blossom.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_normalize_hex_key() {
+        let hex = "0000000000000000000000000000000000000000000000000000000000000001";
+        let result = normalize_to_hex(hex).unwrap();
+        assert_eq!(result, hex);
+    }
+
+    #[test]
+    fn test_normalize_hex_key_whitespace() {
+        let hex = " 0000000000000000000000000000000000000000000000000000000000000001 ";
+        let result = normalize_to_hex(hex).unwrap();
+        assert_eq!(result, hex.trim());
+    }
+
+    #[test]
+    fn test_normalize_invalid_hex() {
+        let result = normalize_to_hex("not-hex-at-all-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_normalize_short_hex() {
+        let result = normalize_to_hex("abcd");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_config_camel_case_keys() {
+        let config = Config::parse_config(
+            "server=https://blossom.example.com\n\
+             privateKey=0000000000000000000000000000000000000000000000000000000000000001\n\
+             chunkSize=4096\n\
+             maxConcurrentUploads=2\n\
+             maxConcurrentDownloads=4\n\
+             irohEndpoint=testep\n\
+             daemonPort=8080",
+        )
+        .unwrap();
+        assert_eq!(config.chunk_size, 4096);
+        assert_eq!(config.max_concurrent_uploads, 2);
+        assert_eq!(config.max_concurrent_downloads, 4);
+        assert_eq!(config.iroh_endpoint.as_deref(), Some("testep"));
+        assert_eq!(config.daemon_port, 8080);
+    }
+
+    #[test]
+    fn test_parse_config_invalid_chunk_size_uses_default() {
+        let config = Config::parse_config(
+            "server=https://blossom.example.com\n\
+             private-key=0000000000000000000000000000000000000000000000000000000000000001\n\
+             chunk-size=not-a-number",
+        )
+        .unwrap();
+        assert_eq!(config.chunk_size, DEFAULT_CHUNK_SIZE);
+    }
+
+    #[test]
+    fn test_from_repo_path_lfsdalconfig() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".lfsdalconfig"),
+            "server=https://example.com\nprivate-key=0000000000000000000000000000000000000000000000000000000000000001",
+        )
+        .unwrap();
+
+        let config = Config::from_repo_path(dir.path()).unwrap();
+        assert_eq!(config.server_url, Some("https://example.com".to_string()));
+    }
+
+    #[test]
+    fn test_from_repo_path_no_config_falls_to_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = Config::from_repo_path(dir.path());
+        assert!(result.is_err());
     }
 }
