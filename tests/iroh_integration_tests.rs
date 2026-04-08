@@ -118,7 +118,7 @@ async fn test_dual_transport_iroh_upload_http_download() {
     let http_addr = http_listener.local_addr().unwrap();
     let http_url = format!("http://{}", http_addr);
     tokio::spawn(async move { axum::serve(http_listener, app).await.ok() });
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     let iroh_server =
         BlobServer::builder(SharedBackend::new(shared_mem.clone()), "iroh://test").build();
@@ -131,7 +131,7 @@ async fn test_dual_transport_iroh_upload_http_download() {
     let _iroh_router = Router::builder(iroh_endpoint)
         .accept(BLOSSOM_ALPN, Arc::new(BlossomProtocol::new(iroh_state)))
         .spawn();
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     let signer = Signer::generate();
     let endpoint_id_str = iroh_addr.id.to_string();
@@ -259,14 +259,14 @@ async fn spawn_iroh_lfs_server() -> (iroh::EndpointAddr, Router) {
         .accept(BLOSSOM_ALPN, Arc::new(BlossomProtocol::new(state)))
         .spawn();
 
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     (addr, router)
 }
 
 async fn spawn_lfs_daemon(port: u16) {
     tokio::spawn(blossom_lfs::daemon::run_daemon(port));
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 }
 
 async fn find_port() -> u16 {
