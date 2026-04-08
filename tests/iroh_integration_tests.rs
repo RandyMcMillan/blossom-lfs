@@ -6,20 +6,18 @@
 #![cfg(feature = "iroh")]
 
 use base64::Engine;
-use blossom_rs::access::OpenAccess;
 use blossom_rs::auth::Signer;
 use blossom_rs::db::MemoryDatabase;
 use blossom_rs::locks::MemoryLockDatabase;
 use blossom_rs::protocol::BlobDescriptor;
 use blossom_rs::server::BlobServer;
 use blossom_rs::storage::{BlobBackend, MemoryBackend};
-use blossom_rs::transport::{BlossomProtocol, IrohState, BLOSSOM_ALPN};
+use blossom_rs::transport::{BlossomProtocol, BLOSSOM_ALPN};
 use blossom_rs::MemoryLfsVersionDatabase;
 use iroh::endpoint::presets::N0;
 use iroh::protocol::Router;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
-use tokio::sync::Mutex;
 
 fn sha256_hex(data: &[u8]) -> String {
     format!("{:x}", Sha256::digest(data))
@@ -122,16 +120,9 @@ async fn test_dual_transport_iroh_upload_http_download() {
     tokio::spawn(async move { axum::serve(http_listener, app).await.ok() });
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-    let iroh_state = Arc::new(Mutex::new(IrohState {
-        backend: Box::new(SharedBackend::new(shared_mem.clone())),
-        database: Box::new(MemoryDatabase::new()),
-        access: Box::new(OpenAccess),
-        base_url: "iroh://test".to_string(),
-        max_upload_size: None,
-        require_auth: false,
-        lock_db: None,
-        lfs_version_db: None,
-    }));
+    let iroh_server =
+        BlobServer::builder(SharedBackend::new(shared_mem.clone()), "iroh://test").build();
+    let iroh_state = iroh_server.shared_state();
     let iroh_endpoint = iroh::Endpoint::builder(N0)
         .bind()
         .await
@@ -251,16 +242,11 @@ fn setup_git_repo_iroh_only(endpoint_id_str: &str, nsec_hex: &str) -> tempfile::
 }
 
 async fn spawn_iroh_lfs_server() -> (iroh::EndpointAddr, Router) {
-    let state = Arc::new(Mutex::new(IrohState {
-        backend: Box::new(MemoryBackend::new()),
-        database: Box::new(MemoryDatabase::new()),
-        access: Box::new(OpenAccess),
-        base_url: "iroh://test".to_string(),
-        max_upload_size: None,
-        require_auth: false,
-        lock_db: Some(Box::new(MemoryLockDatabase::new())),
-        lfs_version_db: Some(Box::new(MemoryLfsVersionDatabase::new())),
-    }));
+    let server = BlobServer::builder(MemoryBackend::new(), "iroh://test")
+        .lock_database(MemoryLockDatabase::new())
+        .lfs_version_database(MemoryLfsVersionDatabase::new())
+        .build();
+    let state = server.shared_state();
 
     let endpoint = iroh::Endpoint::builder(N0)
         .bind()
