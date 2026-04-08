@@ -77,7 +77,11 @@ impl LockClient {
     }
 
     pub async fn create_lock(&self, repo_slug: &str, path: &str) -> Result<LfsLock> {
-        let url = format!("{}/lfs/{}/locks", self.server_url, repo_slug);
+        let url = format!(
+            "{}/lfs/{}/locks",
+            self.server_url,
+            urlencoding::encode(repo_slug)
+        );
         let auth = self.auth_header("lock")?;
 
         let resp = self
@@ -111,7 +115,9 @@ impl LockClient {
     pub async fn unlock(&self, repo_slug: &str, lock_id: &str, force: bool) -> Result<LfsLock> {
         let url = format!(
             "{}/lfs/{}/locks/{}/unlock",
-            self.server_url, repo_slug, lock_id
+            self.server_url,
+            urlencoding::encode(repo_slug),
+            lock_id
         );
         let auth = self.auth_header("lock")?;
 
@@ -144,7 +150,11 @@ impl LockClient {
         cursor: Option<&str>,
         limit: Option<u32>,
     ) -> Result<(Vec<LfsLock>, Option<String>)> {
-        let mut url = format!("{}/lfs/{}/locks", self.server_url, repo_slug);
+        let mut url = format!(
+            "{}/lfs/{}/locks",
+            self.server_url,
+            urlencoding::encode(repo_slug)
+        );
         let mut params = Vec::new();
         if let Some(p) = path {
             params.push(format!("path={}", urlencoding::encode(p)));
@@ -189,7 +199,11 @@ impl LockClient {
         cursor: Option<&str>,
         limit: Option<u32>,
     ) -> Result<(Vec<LfsLock>, Vec<LfsLock>, Option<String>)> {
-        let url = format!("{}/lfs/{}/locks/verify", self.server_url, repo_slug);
+        let url = format!(
+            "{}/lfs/{}/locks/verify",
+            self.server_url,
+            urlencoding::encode(repo_slug)
+        );
         let auth = self.auth_header("lock")?;
 
         let resp = self
