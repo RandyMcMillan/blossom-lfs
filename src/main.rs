@@ -315,30 +315,23 @@ fn install_launchd_service(daemon_port: u16, exe: &str) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("create LaunchAgents dir: {}", e))?;
     std::fs::write(&plist_path, &plist).map_err(|e| anyhow::anyhow!("write plist: {}", e))?;
 
-    // Get UID for launchctl domain target
-    let uid = std::process::Command::new("id")
-        .arg("-u")
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_else(|_| "501".to_string());
-
     // Unload existing if present (ignore errors)
     let _ = std::process::Command::new("launchctl")
-        .args(["bootout", &format!("gui/{}", uid), &plist_path])
+        .args(["unload", &plist_path])
         .status();
 
     let status = std::process::Command::new("launchctl")
-        .args(["bootstrap", &format!("gui/{}", uid), &plist_path])
+        .args(["load", "-w", &plist_path])
         .status()
-        .map_err(|e| anyhow::anyhow!("launchctl bootstrap failed: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("launchctl load failed: {}", e))?;
 
     if status.success() {
         eprintln!("[ok] launchd service installed and started");
         eprintln!("     plist: {}", plist_path);
         eprintln!("     logs:  {}", log_path);
-        eprintln!("     stop:  launchctl bootout gui/{} {}", uid, plist_path);
+        eprintln!("     stop:  launchctl unload {}", plist_path);
     } else {
-        anyhow::bail!("launchctl bootstrap failed");
+        anyhow::bail!("launchctl load failed");
     }
 
     Ok(())
