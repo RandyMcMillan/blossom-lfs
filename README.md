@@ -4,6 +4,10 @@ Git LFS daemon for [Blossom](https://github.com/hzrd149/blossom) blob storage.
 
 A local HTTP server on `localhost:31921` handles all Git LFS operations — vanilla `git lfs` talks to it directly. No custom transfer agent configuration needed.
 
+[![CI](https://github.com/MonumentalSystems/blossom-lfs/actions/workflows/ci.yml/badge.svg)](https://github.com/MonumentalSystems/blossom-lfs/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/blossom-lfs.svg)](https://crates.io/crates/blossom-lfs)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 Built on [blossom-rs](https://crates.io/crates/blossom-rs) for HTTP client, Nostr authentication, and optional iroh QUIC transport.
 
 ## Features
