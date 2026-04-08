@@ -76,4 +76,4 @@ POST /lfs/<b64>/locks/<id>/unlock       Unlock       (→ Blossom BUD-19)
 
 ## Dependencies
 
-- `blossom-rs` — git dependency on `feature/bud-17-19-lfs-locking` branch. Update to crates.io after blossom-rs v0.4.0 is published.
+- `blossom-rs` — v0.4.0 from crates.io
